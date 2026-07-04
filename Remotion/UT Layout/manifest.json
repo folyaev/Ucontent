@@ -1,0 +1,7 @@
+{
+"name": "News Card 1x1 Builder",
+"id": "news-card-1x1-builder",
+"api": "1.0.0",
+"editorType": ["figma"],
+"main": "code.js"
+}

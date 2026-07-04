@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>UContent Script Text</title>
+    <link rel="icon" href="/favicon.svg?v=vbaut" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <strong>UContent</strong>
+        <span id="status">document-first mode</span>
+      </div>
+      <form id="scrape-form" class="scrape-form">
+        <input id="notion-url" type="url" placeholder="Notion URL" autocomplete="off" />
+        <button type="submit">Scrape</button>
+      </form>
+      <select id="scrape-select" title="Saved scrapes">
+        <option value="">Latest</option>
+      </select>
+      <button id="notion-refresh" type="button" disabled title="Refresh Notion">↻</button>
+      <button id="rss-research" type="button" disabled title="RSS candidates for existing topics">RSS</button>
+      <button id="xml-export" type="button" disabled>XML</button>
+      <button id="tg-send" type="button" disabled title="Транслировать в Telegram">TG</button>
+      <button id="theme-toggle" type="button" title="Переключить тему">🌙</button>
+    </header>
+    <main id="document" class="document">
+      <p class="empty">Paste a Notion URL and scrape. The markdown will render here without segmentation.</p>
+    </main>
+    <div id="search-dialog" class="search-dialog" hidden>
+      <div class="search-dialog-panel">
+        <strong id="search-dialog-title">Ищем?</strong>
+        <p id="search-dialog-query"></p>
+        <div class="search-dialog-actions">
+          <button id="search-dialog-yes" type="button">Да</button>
+          <button id="search-dialog-edit" type="button" title="Изменить запрос">✎</button>
+          <button id="search-dialog-cancel" type="button">Отмена</button>
+        </div>
+      </div>
+    </div>
+    <div id="media-picker" class="media-picker" hidden>
+      <div class="media-picker-panel">
+        <div class="media-picker-head">
+          <div>
+            <strong>Media</strong>
+            <span id="media-picker-topic"></span>
+          </div>
+          <button id="media-picker-close" type="button">×</button>
+        </div>
+        <div class="media-picker-actions">
+          <div id="media-upload-dropzone" class="media-upload-dropzone">
+            <span class="dropzone-icon">📁</span>
+            <span class="dropzone-text">Перетащите файлы сюда или нажмите для выбора</span>
+            <input id="media-upload-input" type="file" hidden />
+          </div>
+        </div>
+        <form id="media-download-form" class="media-download-form">
+          <input id="media-download-url" type="url" placeholder="Media URL" autocomplete="off" />
+          <button id="media-download-button" type="submit">Download URL</button>
+          <label class="media-download-fallback">
+            <input id="media-download-fallback-screenshot" type="checkbox" checked />
+            Сделать скриншот страницы, если обычная загрузка не сработает
+          </label>
+        </form>
+        <div id="media-download-status" class="media-download-status"></div>
+        <div id="media-picker-list" class="media-picker-list"></div>
+      </div>
+    </div>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="/script-text.js" type="module"></script>
+  </body>
+</html>

@@ -1,0 +1,10 @@
+data/
+*.log
+node_modules/
+.venv/
+media/
+.env
+.staging/
+Remotion/out/
+__pycache__/
+*.pyc

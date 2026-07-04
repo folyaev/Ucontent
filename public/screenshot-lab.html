@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>UContent Screenshot Lab</title>
+    <link rel="icon" href="/favicon.svg?v=shotlab" type="image/svg+xml" />
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/screenshot-lab.js" type="module"></script>
+  </head>
+  <body class="shotlab-page">
+    <header class="topbar shotlab-topbar">
+      <div class="brand">
+        <strong>Screenshot Lab</strong>
+        <span id="shotlab-status">loading</span>
+      </div>
+      <form id="shotlab-form" class="scrape-form">
+        <input id="shotlab-scrape" type="text" placeholder="Scrape ID" autocomplete="off" />
+        <button type="submit">Open</button>
+      </form>
+      <select id="shotlab-preset" title="Формат">
+        <option value="16x9">16:9</option>
+        <option value="2x1">2:1</option>
+        <option value="1x1">1:1</option>
+      </select>
+      <button id="shotlab-capture" type="button" title="Сделать скриншот">📸</button>
+      <button id="shotlab-manual" type="button" title="Открыть отдельное окно">↗</button>
+      <a class="topbar-link" href="/script-text">Script</a>
+    </header>
+    <main class="shotlab-layout">
+      <aside class="shotlab-sidebar">
+        <div class="shotlab-buttonbar" aria-label="Screenshot controls">
+          <button type="button" data-shot-action="format" title="Сменить формат">🌐</button>
+          <button type="button" data-shot-action="shorter" title="Короче">📜⬆️</button>
+          <button type="button" data-shot-action="taller" title="Длиннее">📜⬇️</button>
+          <button type="button" data-shot-action="zoomin" title="Зум больше">🔎⬆️</button>
+          <button type="button" data-shot-action="zoomout" title="Зум меньше">🔎⬇️</button>
+          <button type="button" data-shot-action="scrollup" title="Скролл вверх">⬆️</button>
+          <button type="button" data-shot-action="scrolldown" title="Скролл вниз">⬇️</button>
+        </div>
+        <div class="shotlab-controls">
+          <label>
+            <span>Высота</span>
+            <input id="shotlab-height" type="number" min="240" max="5120" step="80" />
+          </label>
+          <label>
+            <span>Зум</span>
+            <input id="shotlab-zoom" type="number" min="50" max="800" step="25" />
+          </label>
+          <label>
+            <span>Скролл</span>
+            <input id="shotlab-scroll" type="number" min="0" max="50000" step="100" value="0" />
+          </label>
+        </div>
+        <div id="shotlab-list" class="shotlab-list"></div>
+      </aside>
+      <section class="shotlab-stage">
+        <div class="shotlab-stage-head">
+          <div>
+            <strong id="shotlab-title">No link selected</strong>
+            <a id="shotlab-url" href="#" target="_blank" rel="noopener noreferrer"></a>
+          </div>
+          <a id="shotlab-download" class="shotlab-download" download="screenshot.png" hidden>Download PNG</a>
+        </div>
+        <div class="shotlab-preview">
+          <div id="shotlab-empty" class="empty">Выберите ссылку слева или нажмите 📸.</div>
+          <img id="shotlab-image" alt="Screenshot preview" hidden />
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

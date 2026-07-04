@@ -1,0 +1,30 @@
+{
+  "channels": [
+    {
+      "source_id": "youtube_example_global_news",
+      "name": "Example Global News",
+      "platform": "youtube",
+      "feed_type": "news_channel",
+      "language": "en",
+      "region_focus": "world",
+      "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UC_REPLACE_WITH_NEWS_CHANNEL_ID",
+      "channel_url": "https://www.youtube.com/channel/UC_REPLACE_WITH_NEWS_CHANNEL_ID",
+      "parser_priority": 2,
+      "banned_ru": false,
+      "notes": "High-volume news channel; shown as a separate block in /digest"
+    },
+    {
+      "source_id": "youtube_example_regional_news",
+      "name": "Example Regional News",
+      "platform": "youtube",
+      "feed_type": "news_channel",
+      "language": "ru",
+      "region_focus": "Russia;world",
+      "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UC_REPLACE_WITH_REGIONAL_NEWS_CHANNEL_ID",
+      "channel_url": "https://www.youtube.com/channel/UC_REPLACE_WITH_REGIONAL_NEWS_CHANNEL_ID",
+      "parser_priority": 1,
+      "banned_ru": false,
+      "notes": "Use for frequent news uploads, not author commentary"
+    }
+  ]
+}

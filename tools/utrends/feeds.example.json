@@ -1,0 +1,18 @@
+{
+  "Технологии и Игры": [
+    "https://example.com/technology/rss.xml",
+    "https://example.com/games/feed.xml"
+  ],
+  "Экономика и Бизнес": [
+    "https://example.com/business/rss.xml"
+  ],
+  "Медиа и Развлечения": [
+    "https://example.com/culture/feed.xml"
+  ],
+  "Мировые Новости": [
+    "https://example.com/world/rss.xml"
+  ],
+  "Политика и Иное": [
+    "https://example.com/politics/rss.xml"
+  ]
+}

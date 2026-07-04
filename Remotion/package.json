@@ -1,0 +1,34 @@
+{
+  "name": "ut-motion-graphics",
+  "version": "1.0.0",
+  "description": "Motion graphics workspace powered by Remotion.",
+  "private": true,
+  "scripts": {
+    "start": "remotion studio src/index.ts",
+    "studio": "remotion studio src/index.ts --props=data/quote-2x1.json",
+    "render": "npm run render:2x1",
+    "render:2x1": "remotion render src/index.ts Quote2x1 out/quote-2x1.mp4 --props=data/quote-2x1.json --codec=h264 --crf=16",
+    "render:2x1:alpha": "remotion render src/index.ts Quote2x1Alpha out/quote-2x1-alpha.webm --props=data/quote-2x1-alpha.json --codec=vp8 --pixel-format=yuva420p --image-format=png",
+    "render:1x1": "remotion render src/index.ts Quote1x1 out/quote-1x1.mp4 --props=data/quote-1x1.json --codec=h264 --crf=16",
+    "render:1x1:alpha": "remotion render src/index.ts Quote1x1Alpha out/quote-1x1-alpha.webm --props=data/quote-1x1-alpha.json --codec=vp8 --pixel-format=yuva420p --image-format=png",
+    "generate": "node scripts/render.mjs",
+    "still:2x1": "remotion still src/index.ts Quote2x1 out/quote-2x1-frame.png --props=data/quote-2x1.json --frame=100",
+    "still:1x1": "remotion still src/index.ts Quote1x1 out/quote-1x1-frame.png --props=data/quote-1x1.json --frame=100",
+    "check": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@remotion/cli": "^4.0.459",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6",
+    "remotion": "^4.0.459"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^6.0.3"
+  }
+}

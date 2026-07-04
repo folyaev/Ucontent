@@ -1,0 +1,30 @@
+{
+  "channels": [
+    {
+      "source_id": "youtube_example_tech_author",
+      "name": "Example Tech Author",
+      "platform": "youtube",
+      "feed_type": "blogger",
+      "language": "ru",
+      "region_focus": "technology;world",
+      "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UC_REPLACE_WITH_CHANNEL_ID",
+      "channel_url": "https://www.youtube.com/channel/UC_REPLACE_WITH_CHANNEL_ID",
+      "parser_priority": 2,
+      "banned_ru": false,
+      "notes": "Author channel; title topics are usually separated by / or |"
+    },
+    {
+      "source_id": "youtube_example_interview_show",
+      "name": "Example Interview Show",
+      "platform": "youtube",
+      "feed_type": "blogger",
+      "language": "ru",
+      "region_focus": "society;media",
+      "url": "https://www.youtube.com/feeds/videos.xml?channel_id=UC_REPLACE_WITH_ANOTHER_CHANNEL_ID",
+      "channel_url": "https://www.youtube.com/channel/UC_REPLACE_WITH_ANOTHER_CHANNEL_ID",
+      "parser_priority": 1,
+      "banned_ru": false,
+      "notes": "Higher priority source for /bloggers"
+    }
+  ]
+}

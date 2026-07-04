@@ -1,0 +1,55 @@
+{
+    "Технологии и Игры": [
+        "https://www.cnews.ru/inc/rss/news.xml",
+        "https://vc.ru/rss",
+        "https://www.iphones.ru/feed",
+        "https://ixbt.games/export/rss.xml",
+        "https://shazoo.ru/feed/rss",
+        "https://devby.io/rss",
+        "https://habr.com/ru/rss/news/",
+        "https://www.reddit.com/r/technology/.rss",
+        "https://www.theverge.com/rss/index.xml",
+        "https://www.wired.com/feed/rss",
+        "https://techcrunch.com/feed/",
+        "https://kotaku.com/rss",
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCBJycsmduvYEL83R_U4JriQ",
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UC7vVhkEfw4nOGp8TyDk7RcQ"
+    ],
+    "Экономика и Бизнес": [
+        "https://rssexport.rbc.ru/rbcnews/news/30/full.rss",
+        "https://www.vedomosti.ru/rss/news",
+        "https://www.kommersant.ru/RSS/news.xml",
+        "https://rb.ru/feeds/all/",
+        "https://www.forbes.ru/",
+        "https://www.reddit.com/r/economics/.rss",
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCYWpWVSfndpbq1dDsWVslzA"
+    ],
+    "Медиа и Развлечения": [
+        "https://daily.afisha.ru/rss/",
+        "https://moskvichmag.ru/feed/",
+        "https://reminder.media/feed",
+        "https://nplus1.ru/rss",
+        "https://www.sciencedaily.com/rss/all.xml",
+        "https://www.dezeen.com/feed/",
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCuPivVjnfNo4mb3Oog_frZg",
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCWOA1ZGywLbqmigxE4Qlvuw",
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UC_IRYSp4auq7hKLvziWVH6w",
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCP-Ng5SXUEt0VE-TXqRdL6g"
+    ],
+    "Мировые Новости": [
+        "https://www.reddit.com/r/worldnews/.rss",
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UChqUTb7kYRX8-EiaN3XFrSQ",
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCKjU3KzdbJE1EFcHVqXC3_g",
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UC52X5wxOL_s5yw0dQk7NtgA",
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCshwRhftzkiov5wKR7M_LsQ",
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UC-uhvujip5deVcEtLxnW8qg",
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UC86dbj-lbDks_hZ5gRKL49Q"
+    ],
+    "Политика и Иное": [
+        "https://news.ru/rss/",
+        "https://ruposters.ru/rss",
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCLxr1ACVGlrUvpGkc_ruMKg",
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCKrHcU-xnrRl_YbhrDwe7sA",
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCWrWMJFCkYWf7GmqoUR4TRA"
+    ]
+}

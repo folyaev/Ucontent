@@ -1,0 +1,61 @@
+services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: ucontent-telegram-bot-api
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: "true"
+      TELEGRAM_VERBOSITY: "2"
+    command:
+      - --http-port=8081
+      - --dir=/var/lib/telegram-bot-api
+      - --temp-dir=/tmp/telegram-bot-api
+      - --verbosity=2
+      - --local
+    volumes:
+      - telegram_bot_api_data:/var/lib/telegram-bot-api
+
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    container_name: ucontent-searxng
+    restart: unless-stopped
+    ports:
+      - "8888:8080"
+    environment:
+      - BASE_URL=http://localhost:8888/
+      - INSTANCE_NAME=UContent Search
+
+  ucontent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ucontent
+    restart: unless-stopped
+    depends_on:
+      - telegram-bot-api
+      - searxng
+    env_file:
+      - ./.env
+    environment:
+      BASE_API_URL: http://telegram-bot-api:8081/bot
+      BASE_FILE_URL: http://telegram-bot-api:8081/file
+      RESEARCH_SEARXNG_URL: http://searxng:8080
+      UCONTENT_PYTHON: /app/.venv/bin/python
+      UTRENDS_PYTHON: /app/.venv/bin/python
+      PAMPAM_ROOT: /app/media
+      MEDIA_DOWNLOAD_ROOT: /app/media
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+    ports:
+      - "5197:5197"
+    volumes:
+      - ./data:/app/data
+      - "${PAMPAM_HOST_ROOT:-./media}:/app/media"
+      - telegram_bot_api_data:/var/lib/telegram-bot-api
+
+volumes:
+  telegram_bot_api_data:

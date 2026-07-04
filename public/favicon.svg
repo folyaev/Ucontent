@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 900" shape-rendering="crispEdges">
+  <rect x="0" y="0" width="900" height="900" rx="180" fill="#ffffff"/>
+
+  <!-- Eyes -->
+  <rect x="293" y="229" width="60" height="62" fill="#000"/>
+  <rect x="546" y="229" width="61" height="62" fill="#000"/>
+
+  <!-- Upper blocks -->
+  <rect x="228" y="291" width="65" height="126" fill="#000"/>
+  <rect x="353" y="291" width="65" height="126" fill="#000"/>
+  <rect x="480" y="291" width="66" height="126" fill="#000"/>
+  <rect x="607" y="291" width="65" height="126" fill="#000"/>
+
+  <!-- Main body -->
+  <rect x="102" y="483" width="63" height="125" fill="#000"/>
+  <rect x="228" y="483" width="190" height="125" fill="#000"/>
+  <rect x="480" y="483" width="192" height="125" fill="#000"/>
+  <rect x="735" y="483" width="63" height="125" fill="#000"/>
+
+  <!-- Lower blocks -->
+  <rect x="165" y="546" width="63" height="122" fill="#000"/>
+  <rect x="418" y="546" width="62" height="62" fill="#000"/>
+  <rect x="672" y="546" width="63" height="122" fill="#000"/>
+
+  <rect x="228" y="608" width="125" height="60" fill="#000"/>
+  <rect x="546" y="608" width="126" height="60" fill="#000"/>
+</svg>

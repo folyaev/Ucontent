@@ -1,0 +1,1 @@
+"""UTrends Telegram bot package."""
