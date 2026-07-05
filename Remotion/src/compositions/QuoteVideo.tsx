@@ -453,6 +453,11 @@ export const QuoteVideo = ({
 }: QuoteVideoProps) => {
   const {width, height} = useVideoConfig();
   const {enter, delayed, exit} = useAnimation();
+  const frame = useCurrentFrame();
+  const fade = interpolate(frame, [8, 22], [0, 1], {
+    extrapolateLeft: 'clamp',
+    extrapolateRight: 'clamp',
+  }) * exit;
   
   // 1920px is the Figma base height for both 1:1 and 2:1 templates
   const s = height / 1920;
@@ -564,8 +569,7 @@ export const QuoteVideo = ({
           <div
             style={{
               marginBottom: isBL ? 40 * s : 0,
-              opacity: delayed * exit,
-              transform: `translateY(${interpolate(delayed, [0, 1], [-25 * s, 0])}px) scale(${interpolate(delayed, [0, 1], [0.85, 1.0])})`,
+              opacity: fade,
             }}
           >
             {logoNode}
@@ -675,9 +679,7 @@ export const QuoteVideo = ({
           <div
             style={{
               alignSelf: isCenter ? 'center' : 'flex-start',
-              opacity: delayed * exit,
-              transform: `translateY(${interpolate(delayed, [0, 1], [-25 * s, 0])}px) scale(${interpolate(delayed, [0, 1], [0.85, 1.0])})`,
-              transformOrigin: isCenter ? 'center' : 'left center',
+              opacity: fade,
             }}
           >
             <Logo
@@ -724,9 +726,7 @@ export const QuoteVideo = ({
                 flexDirection: 'column',
                 gap: 8 * s,
                 alignItems: alignItem,
-                opacity: delayed * exit,
-                transform: `translateY(${interpolate(delayed, [0, 1], [25 * s, 0])}px) scale(${interpolate(delayed, [0, 1], [0.95, 1.0])})`,
-                transformOrigin: isCenter ? 'center' : 'left center',
+                opacity: fade,
                 textShadow: shadow,
               }}
             >
@@ -813,9 +813,7 @@ export const QuoteVideo = ({
             position: 'absolute',
             left,
             top: baseline - 120 * s,
-            opacity: delayed * exit,
-            transform: `translateY(${interpolate(delayed, [0, 1], [20 * s, 0])}px) scale(${interpolate(delayed, [0, 1], [0.85, 1.0])})`,
-            transformOrigin: 'left center',
+            opacity: fade,
           }}
         >
           <Logo
@@ -842,9 +840,7 @@ export const QuoteVideo = ({
               color: '#686868',
               letterSpacing: '-0.01em',
               textAlign: 'right',
-              opacity: delayed * exit,
-              transform: `translateY(${interpolate(delayed, [0, 1], [20 * s, 0])}px) scale(${interpolate(delayed, [0, 1], [0.95, 1.0])})`,
-              transformOrigin: 'right center',
+              opacity: fade,
               textShadow: shadow,
             }}
           >
@@ -927,9 +923,7 @@ export const QuoteVideo = ({
           position: 'absolute',
           left,
           top: baseline - 120 * s,
-          opacity: delayed * exit,
-          transform: `translateY(${interpolate(delayed, [0, 1], [20 * s, 0])}px) scale(${interpolate(delayed, [0, 1], [0.85, 1.0])})`,
-          transformOrigin: 'left center',
+          opacity: fade,
         }}
       >
         <Logo
@@ -954,9 +948,7 @@ export const QuoteVideo = ({
             flexDirection: 'column',
             alignItems: 'flex-end',
             gap: 12 * s,
-            opacity: delayed * exit,
-            transform: `translateY(${interpolate(delayed, [0, 1], [25 * s, 0])}px) scale(${interpolate(delayed, [0, 1], [0.95, 1.0])})`,
-            transformOrigin: 'right center',
+            opacity: fade,
             textShadow: shadow,
           }}
         >
