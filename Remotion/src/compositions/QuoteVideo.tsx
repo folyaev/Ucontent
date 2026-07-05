@@ -446,6 +446,7 @@ export const QuoteVideo = ({
   date,
   meta,
   accent,
+  textScale = 1,
   background,
   avatar,
   logoIcon,
@@ -461,6 +462,7 @@ export const QuoteVideo = ({
   
   // 1920px is the Figma base height for both 1:1 and 2:1 templates
   const s = height / 1920;
+  const mainTextScale = Math.max(0.72, Math.min(1.38, Number(textScale) || 1));
   
   // Resolve content aliases
   const logoText = clean(logo || source) || 'UT';
@@ -544,7 +546,7 @@ export const QuoteVideo = ({
       </span>
     );
 
-    const {size: titleFontSize, line: titleLineHeight} = getNews1x1Metrics(contentText, s);
+    const {size: titleFontSize, line: titleLineHeight} = getNews1x1Metrics(contentText, s * mainTextScale);
 
     return (
       <AbsoluteFill style={rootStyle}>
@@ -623,8 +625,8 @@ export const QuoteVideo = ({
     const isCenter = resolvedLayout === 'Center';
     const isBadge = resolvedLayout === 'Badge';
     const {size: quoteFontSize, line: quoteLineHeight} = isCenter
-      ? getQuote1x1CenterMetrics(contentText, s)
-      : getQuote1x1LeftMetrics(contentText, s);
+      ? getQuote1x1CenterMetrics(contentText, s * mainTextScale)
+      : getQuote1x1LeftMetrics(contentText, s * mainTextScale);
       
     const textAlign = isCenter ? 'center' : 'left';
     const alignItem = isCenter ? 'center' : 'flex-start';
@@ -772,7 +774,7 @@ export const QuoteVideo = ({
     const baseline = 1426 * s;
     const footerHeight = 120 * s; // Logo size 120px
 
-    const {size: titleFontSize, line: titleLineHeight} = getNews2x1Metrics(contentText, s);
+    const {size: titleFontSize, line: titleLineHeight} = getNews2x1Metrics(contentText, s * mainTextScale);
 
     return (
       <AbsoluteFill style={rootStyle}>
@@ -858,7 +860,7 @@ export const QuoteVideo = ({
   const baseline = 1426 * s;
 
   const authorLines = [authorText, roleText || dateText].filter(Boolean);
-  const {size: quoteFontSize, line: quoteLineHeight} = getQuote2x1Metrics(contentText, s);
+  const {size: quoteFontSize, line: quoteLineHeight} = getQuote2x1Metrics(contentText, s * mainTextScale);
 
   const isBadge = resolvedLayout === 'Badge';
 

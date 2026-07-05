@@ -638,11 +638,15 @@ function shouldHideMediaFile(fileName) {
 }
 
 function isImageFile(filePath) {
-  return [".png", ".jpg", ".jpeg", ".webp", ".gif"].includes(path.extname(filePath).toLowerCase());
+  return [".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg"].includes(path.extname(filePath).toLowerCase());
 }
 
 function isVideoMediaFile(filePath) {
   return [".mp4", ".mov", ".webm", ".mkv"].includes(path.extname(filePath).toLowerCase());
+}
+
+function isLogoFile(filePath) {
+  return [".png", ".jpg", ".jpeg", ".webp", ".svg"].includes(path.extname(filePath).toLowerCase());
 }
 
 function isPreviewableMediaFile(filePath) {
@@ -773,6 +777,58 @@ async function listMediaFiles(maxFiles = 800) {
     }
   }
   return files.sort((a, b) => String(b.updated_at ?? "").localeCompare(String(a.updated_at ?? "")));
+}
+
+function logoDisplayName(relPath, metadata = {}) {
+  const title = String(metadata?.title || metadata?.name || "").trim();
+  if (title) return title;
+  return path.posix.basename(String(relPath || ""), path.posix.extname(String(relPath || "")))
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function listLogoFiles(query = "", maxFiles = 80) {
+  const logosDir = path.join(PAMPAM_ROOT, "logos");
+  assertPathInsideRoot(PAMPAM_ROOT, logosDir, "logos directory");
+  await fs.mkdir(logosDir, { recursive: true });
+  const normalizedQuery = String(query || "").trim().toLowerCase();
+  const files = [];
+  const stack = ["logos"];
+  while (stack.length && files.length < 500) {
+    const currentRel = stack.pop();
+    const currentDir = path.join(PAMPAM_ROOT, currentRel);
+    const entries = await fs.readdir(currentDir, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const relPath = path.join(currentRel, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name.trim().toLowerCase() === "_originals") continue;
+        stack.push(relPath);
+        continue;
+      }
+      if (!entry.isFile() || !isLogoFile(entry.name) || shouldHideMediaFile(entry.name)) continue;
+      const normalizedRel = relPath.split(path.sep).join("/");
+      const stats = await fs.stat(path.join(PAMPAM_ROOT, relPath)).catch(() => null);
+      if (!stats?.isFile()) continue;
+      const indexed = await MEDIA_INDEX.get(normalizedRel);
+      const label = logoDisplayName(normalizedRel, indexed);
+      const haystack = `${normalizedRel} ${label} ${indexed?.title || ""} ${indexed?.description || ""}`.toLowerCase();
+      if (normalizedQuery && !haystack.includes(normalizedQuery)) continue;
+      files.push({
+        ...(indexed || {}),
+        path: normalizedRel,
+        name: entry.name,
+        label,
+        topic: "logos",
+        size: stats.size,
+        updated_at: stats.mtime?.toISOString?.() ?? null,
+        thumbnail: `/api/media/raw?path=${encodeURIComponent(normalizedRel)}`
+      });
+    }
+  }
+  return files
+    .sort((a, b) => String(a.label || a.name).localeCompare(String(b.label || b.name), "ru"))
+    .slice(0, maxFiles);
 }
 
 async function registerDownloadedMedia(job, outputFiles) {
@@ -2862,6 +2918,20 @@ async function handleMediaLibrary(reqUrl, res) {
   });
 }
 
+async function handleLogoLibrary(reqUrl, res) {
+  const query = String(reqUrl.searchParams.get("q") || "").trim();
+  const files = await listLogoFiles(query, 80);
+  json(res, 200, {
+    folder: "logos",
+    query,
+    recommendation: {
+      square: "1024x1024 px or larger, transparent PNG/WebP/SVG",
+      horizontal: "2400 px or wider, transparent PNG/WebP/SVG"
+    },
+    files
+  });
+}
+
 async function handleMediaUpload(req, res) {
   const body = await readBody(req);
   const topic = String(body.topic || "").trim();
@@ -2958,7 +3028,8 @@ function remotionMediaAssetRef(value) {
   relPath = relPath.replace(/^\/+/, "").replace(/^media\//i, "");
   if (!relPath) return "";
   if (!/[\\/]/.test(relPath) && !/\.[a-z0-9]{2,5}$/i.test(relPath)) return "";
-  safeResolveMediaPathForRoot(PAMPAM_ROOT, relPath);
+  const absolutePath = safeResolveMediaPathForRoot(PAMPAM_ROOT, relPath);
+  if (!absolutePath) return "";
   return `${UCONTENT_SELF_URL}/api/media/raw?path=${encodeURIComponent(relPath)}`;
 }
 
@@ -2970,6 +3041,8 @@ function buildRemotionProps(body = {}) {
   const role = cleanRemotionText(props.role || body.role, 180);
   const date = cleanRemotionText(props.date || props.meta || body.date || body.meta, 80);
   const label = cleanRemotionText(props.label || body.label, 80);
+  const textScaleRaw = Number(props.textScale || props.text_scale || body.textScale || body.text_scale || 1);
+  const textScale = Number.isFinite(textScaleRaw) ? Math.max(0.72, Math.min(1.38, textScaleRaw)) : 1;
   const accent = /^#[0-9a-f]{6}$/i.test(String(props.accent || body.accent || "")) ? String(props.accent || body.accent) : "#f0b24c";
   const type = ["news", "quote"].includes(String(props.type || body.type || "")) ? String(props.type || body.type) : undefined;
   const layout = cleanRemotionText(props.layout || body.layout, 24);
@@ -2997,6 +3070,7 @@ function buildRemotionProps(body = {}) {
     meta: date,
     label,
     accent,
+    textScale,
     transparent,
     ...(avatar ? { avatar } : {}),
     ...(logoIcon ? { logoIcon } : {}),
@@ -3438,6 +3512,10 @@ async function handleRequest(req, res) {
       await handleMediaLibrary(reqUrl, res);
       return;
     }
+    if (req.method === "GET" && reqUrl.pathname === "/api/logos") {
+      await handleLogoLibrary(reqUrl, res);
+      return;
+    }
     if (req.method === "POST" && reqUrl.pathname === "/api/media-download") {
       await handleMediaDownload(req, res);
       return;
@@ -3546,6 +3624,7 @@ server.listen(PORT, () => {
     sanitizeMediaTopicName,
     ensureTopicDir,
     listMediaFiles,
+    listLogoFiles,
     getMediaMetadata: MEDIA_INDEX.get,
     upsertMediaMetadata: MEDIA_INDEX.upsert,
     moveMediaMetadata: MEDIA_INDEX.move,

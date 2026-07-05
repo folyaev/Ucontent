@@ -30,6 +30,7 @@ export type QuoteVideoProps = {
   
   label?: string;
   accent?: string;
+  textScale?: number; // Multiplier for title / quote typography
   logoIcon?: string; // Logo icon URL or path or special keyword
   showDecorativeQuote?: boolean; // Whether to render the background decorative quote mark
   

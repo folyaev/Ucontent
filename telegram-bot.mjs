@@ -62,6 +62,9 @@ async function loadSession(dataDir) {
       folderMoveContexts: {},
       folderCreateCtx: null,
       remotionCtx: null,
+      remotionDefaults: {},
+      logoPickCtx: null,
+      remotionRenders: [],
       cutJobs: {},
       trimJobs: {},
       trimInputCtx: null,
@@ -81,6 +84,11 @@ async function loadSession(dataDir) {
     : {};
   currentSession.folderCreateCtx = currentSession.folderCreateCtx || null;
   currentSession.remotionCtx = currentSession.remotionCtx || null;
+  currentSession.remotionDefaults = currentSession.remotionDefaults && typeof currentSession.remotionDefaults === "object" && !Array.isArray(currentSession.remotionDefaults)
+    ? currentSession.remotionDefaults
+    : {};
+  currentSession.logoPickCtx = currentSession.logoPickCtx || null;
+  currentSession.remotionRenders = Array.isArray(currentSession.remotionRenders) ? currentSession.remotionRenders : [];
   currentSession.renameCtx = currentSession.renameCtx || null;
   currentSession.cutJobs = currentSession.cutJobs && typeof currentSession.cutJobs === "object" ? currentSession.cutJobs : {};
   currentSession.trimJobs = currentSession.trimJobs && typeof currentSession.trimJobs === "object" ? currentSession.trimJobs : {};
@@ -1588,23 +1596,53 @@ const REMOTION_FORMATS = new Set([
   "news-2x1-alpha"
 ]);
 
+const REMOTION_FORMAT_OPTIONS = ["quote-1x1", "quote-2x1", "news-1x1", "news-2x1"];
+const REMOTION_LAYOUT_OPTIONS = ["Left", "Center", "Wide", "TL", "BL"];
+const REMOTION_FIELD_LABELS = {
+  quote: "цитату / заголовок",
+  author: "имя автора",
+  role: "должность автора",
+  date: "дату",
+  background: "фон: путь/URL фото или видео",
+  logo: "лого или источник"
+};
+
+function defaultRemotionDraft(text = "") {
+  const defaults = currentSession?.remotionDefaults || {};
+  const quote = String(text || "").trim();
+  return {
+    format: "quote-1x1",
+    props: {
+      type: "quote",
+      layout: "Left",
+      source: String(defaults.source || "UContent").trim(),
+      quote,
+      title: quote,
+      author: "",
+      role: "",
+      date: "",
+      meta: "",
+      logoIcon: String(defaults.logoIcon || "").trim(),
+      accent: "#f0b24c",
+      textScale: 1,
+      background: { dim: 0.7 }
+    },
+    logoChoices: []
+  };
+}
+
 function remotionHelpText() {
   return [
     "<b>Remotion</b>",
-    "Пришлите текст для карточки или заполните поля:",
+    "Открою панель настройки карточки. Поля редактируются кнопками, результат можно перерендерить кнопками A-/A+.",
     "",
-    "Текст: нужный заголовок или цитата",
-    "Автор: Имя Фамилия",
-    "Должность: редактор / CEO / источник",
-    "Лого: graphics/logo.png или URL",
-    "Фон: graphics/bg.mp4 или URL",
-    "Формат: quote-1x1",
+    "Логотипы храните в <code>media/logos</code>: PNG/WebP/SVG с прозрачностью; 1024x1024+ для знака или 2400px+ по ширине для горизонтального лого.",
     "",
     "Быстро: <code>/remotion Текст карточки</code>"
   ].join("\n");
 }
 
-function parseRemotionMessage(text) {
+function parseRemotionMessage(text, defaults = {}) {
   const lines = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
   const fields = {};
   let currentKey = "";
@@ -1638,12 +1676,12 @@ function parseRemotionMessage(text) {
     format,
     props: {
       type: format.startsWith("news-") ? "news" : "quote",
-      source: String(fields.source || "UContent").trim(),
+      source: String(fields.source || defaults.source || "UContent").trim(),
       quote,
       title: quote,
       author: String(fields.author || "").trim(),
       role: String(fields.role || "").trim(),
-      logoIcon: String(fields.logoIcon || "").trim(),
+      logoIcon: String(fields.logoIcon || defaults.logoIcon || "").trim(),
       accent: "#f0b24c",
       background: String(fields.background || "").trim()
         ? { image: String(fields.background).trim(), dim: 0.62, blur: 0 }
@@ -1654,8 +1692,29 @@ function parseRemotionMessage(text) {
 
 async function renderTelegramRemotion(token, chatId, text) {
   if (!botContext?.renderRemotionCard) throw new Error("Remotion renderer is unavailable");
-  const body = parseRemotionMessage(text);
+  const body = parseRemotionMessage(text, currentSession.remotionDefaults || {});
   if (!body.props.quote) throw new Error("Нужен текст заголовка или цитаты");
+  return renderTelegramRemotionBody(token, chatId, body);
+}
+
+function rememberRemotionRender(body) {
+  const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+  const renders = Array.isArray(currentSession.remotionRenders) ? currentSession.remotionRenders : [];
+  currentSession.remotionRenders = [{ id, body, createdAt: new Date().toISOString() }, ...renders].slice(0, 20);
+  return id;
+}
+
+function remotionResultMarkup(renameId, renderId) {
+  const base = renameButtonMarkup(renameId);
+  const rows = Array.isArray(base.inline_keyboard) ? [...base.inline_keyboard] : [];
+  rows.unshift([
+    { text: "A-", callback_data: `sdvg:remotion:font:${renderId}:-` },
+    { text: "A+", callback_data: `sdvg:remotion:font:${renderId}:+` }
+  ]);
+  return { inline_keyboard: rows };
+}
+
+async function renderTelegramRemotionBody(token, chatId, body) {
   const statusMsg = await callApi(token, "sendMessage", {
     chat_id: chatId,
     text: "Рендерю Remotion-карточку..."
@@ -1667,6 +1726,7 @@ async function renderTelegramRemotion(token, chatId, text) {
     const stats = filePath ? await fs.stat(filePath).catch(() => null) : null;
     if (!filePath || !stats?.isFile?.()) throw new Error("Готовый файл не найден");
     const renameId = rememberRenameTarget(relPath, "", -1, "");
+    const renderId = rememberRemotionRender(body);
     const caption = buildReturnedMediaCaption({
       fileName: result.file.name || path.basename(filePath),
       sourceUrl: "",
@@ -1682,7 +1742,7 @@ async function renderTelegramRemotion(token, chatId, text) {
       chat_id: chatId,
       caption,
       parse_mode: "HTML",
-      reply_markup: renameButtonMarkup(renameId)
+      reply_markup: remotionResultMarkup(renameId, renderId)
     }, filePath, safeTelegramUploadFileName(result.file.name || path.basename(filePath), "remotion.mp4"));
     if (sentMessage?.message_id && attachRenameTargetMessage(renameId, chatId, sentMessage.message_id)) {
       await saveSession(botContext.DATA_DIR, currentSession);
@@ -1697,6 +1757,149 @@ async function renderTelegramRemotion(token, chatId, text) {
     }).catch(() => null);
     throw error;
   }
+}
+
+function logoLabel(file) {
+  return String(file?.label || file?.title || file?.name || file?.path || "").trim();
+}
+
+function buildLogoPickerMarkup(ctx, page = 0) {
+  const files = Array.isArray(ctx?.files) ? ctx.files : [];
+  const pageSize = 8;
+  const pages = Math.max(1, Math.ceil(files.length / pageSize));
+  const currentPage = Math.min(Math.max(0, Number(page) || 0), pages - 1);
+  const start = currentPage * pageSize;
+  const rows = files.slice(start, start + pageSize).map((file, offset) => {
+    const index = start + offset;
+    const label = logoLabel(file) || file.path;
+    return [{ text: label.length > 46 ? `${label.slice(0, 43)}...` : label, callback_data: `sdvg:logo:sel:${index}` }];
+  });
+  if (pages > 1) {
+    rows.push([
+      { text: "<", callback_data: `sdvg:logo:page:${Math.max(0, currentPage - 1)}` },
+      { text: `${currentPage + 1}/${pages}`, callback_data: "sdvg:logo:noop" },
+      { text: ">", callback_data: `sdvg:logo:page:${Math.min(pages - 1, currentPage + 1)}` }
+    ]);
+  }
+  rows.push([{ text: "✖", callback_data: "sdvg:logo:close" }]);
+  return { inline_keyboard: rows };
+}
+
+async function showLogoPicker(token, chatId, query = "", page = 0, messageId = null) {
+  const files = await botContext.listLogoFiles(String(query || "").trim(), 80);
+  currentSession.logoPickCtx = {
+    query: String(query || "").trim(),
+    files,
+    page: Number(page) || 0
+  };
+  await saveSession(botContext.DATA_DIR, currentSession);
+  const text = [
+    files.length
+      ? `Логотипы в <code>media/logos</code>${query ? ` по запросу <b>${escapeHtml(query)}</b>` : ""}:`
+      : `Логотипы не найдены${query ? ` по запросу "${escapeHtml(query)}"` : ""}.`,
+    "",
+    "Рекомендуемый размер: PNG/WebP/SVG с прозрачностью; 1024x1024+ для знака или 2400px+ по ширине для горизонтального лого."
+  ].join("\n");
+  const payload = {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    reply_markup: buildLogoPickerMarkup(currentSession.logoPickCtx, page)
+  };
+  if (messageId) {
+    await callApi(token, "editMessageText", { ...payload, message_id: messageId }).catch(async () => {
+      await callApi(token, "sendMessage", payload);
+    });
+  } else {
+    await callApi(token, "sendMessage", payload);
+  }
+}
+
+function remotionDraftSummary(draft) {
+  const props = draft?.props || {};
+  const background = props.background?.image || "";
+  return [
+    "<b>Remotion</b>",
+    "",
+    `<b>Цитата:</b> ${props.quote ? escapeHtml(clipLabel(props.quote, 180)) : "<i>не задано</i>"}`,
+    `<b>Автор:</b> ${props.author ? escapeHtml(props.author) : "<i>не задан</i>"}`,
+    `<b>Должность:</b> ${props.role ? escapeHtml(props.role) : "<i>не задана</i>"}`,
+    `<b>Дата:</b> ${props.date ? escapeHtml(props.date) : "<i>не задана</i>"}`,
+    `<b>Источник:</b> ${props.source ? escapeHtml(props.source) : "<i>не задан</i>"}`,
+    `<b>Лого:</b> ${props.logoIcon ? `<code>${escapeHtml(props.logoIcon)}</code>` : "<i>текстом</i>"}`,
+    `<b>Фон:</b> ${background ? `<code>${escapeHtml(background)}</code>` : "<i>без файла</i>"}`,
+    `<b>Формат:</b> <code>${escapeHtml(draft.format || "quote-1x1")}</code>`,
+    `<b>Выравнивание:</b> <code>${escapeHtml(props.layout || "Left")}</code>`,
+    `<b>Шрифт:</b> ${Math.round((Number(props.textScale || 1) || 1) * 100)}%`
+  ].join("\n");
+}
+
+function remotionPanelMarkup(draft) {
+  const format = String(draft?.format || "quote-1x1");
+  const layout = String(draft?.props?.layout || "Left");
+  const rows = [
+    [
+      { text: "Цитата", callback_data: "sdvg:remotion:field:quote" },
+      { text: "Автор", callback_data: "sdvg:remotion:field:author" }
+    ],
+    [
+      { text: "Должность", callback_data: "sdvg:remotion:field:role" },
+      { text: "Дата", callback_data: "sdvg:remotion:field:date" }
+    ],
+    [
+      { text: `Формат: ${format}`, callback_data: "sdvg:remotion:cycle:format" },
+      { text: `Выравн.: ${layout}`, callback_data: "sdvg:remotion:cycle:layout" }
+    ],
+    [
+      { text: "Лого / источник", callback_data: "sdvg:remotion:field:logo" },
+      { text: "Фон", callback_data: "sdvg:remotion:field:background" }
+    ]
+  ];
+  const logoChoices = Array.isArray(draft?.logoChoices) ? draft.logoChoices.slice(0, 6) : [];
+  if (logoChoices.length) {
+    rows.push(...logoChoices.map((file, index) => ([{
+      text: `Лого: ${clipLabel(logoLabel(file), 34)}`,
+      callback_data: `sdvg:remotion:logo:${index}`
+    }])));
+    rows.push([{ text: "Использовать как текст источника", callback_data: "sdvg:remotion:logoText" }]);
+  }
+  rows.push([{ text: "Render", callback_data: "sdvg:remotion:render" }, { text: "Закрыть", callback_data: "sdvg:remotion:close" }]);
+  return { inline_keyboard: rows };
+}
+
+async function showRemotionPanel(token, chatId, messageId = null) {
+  const draft = currentSession.remotionCtx?.draft || defaultRemotionDraft();
+  currentSession.remotionCtx = {
+    ...(currentSession.remotionCtx || {}),
+    draft,
+    chatId,
+    createdAt: currentSession.remotionCtx?.createdAt || new Date().toISOString()
+  };
+  await saveSession(botContext.DATA_DIR, currentSession);
+  const payload = {
+    chat_id: chatId,
+    text: remotionDraftSummary(draft),
+    parse_mode: "HTML",
+    reply_markup: remotionPanelMarkup(draft)
+  };
+  if (messageId) {
+    await callApi(token, "editMessageText", { ...payload, message_id: messageId }).catch(async () => {
+      const sent = await callApi(token, "sendMessage", payload);
+      currentSession.remotionCtx.panelMessageId = sent?.message_id || null;
+      await saveSession(botContext.DATA_DIR, currentSession);
+    });
+  } else {
+    const sent = await callApi(token, "sendMessage", payload);
+    currentSession.remotionCtx.panelMessageId = sent?.message_id || null;
+    await saveSession(botContext.DATA_DIR, currentSession);
+  }
+}
+
+function remotionPromptForField(field) {
+  if (field === "logo") {
+    return "Введите название источника, путь/URL логотипа или поисковый запрос по media/logos.";
+  }
+  return `Введите ${REMOTION_FIELD_LABELS[field] || "значение"}.`;
 }
 
 async function sendActiveScrapeXml(token, chatId) {
@@ -3920,10 +4123,44 @@ async function handleTextMessage(token, message) {
     }
   }
 
-  if (currentSession.remotionCtx && !text.startsWith("/")) {
-    currentSession.remotionCtx = null;
+  if (currentSession.remotionCtx?.awaitField && !text.startsWith("/")) {
+    const ctx = currentSession.remotionCtx;
+    const field = ctx.awaitField;
+    const draft = ctx.draft || defaultRemotionDraft();
+    const value = text.trim();
+    if (ctx.promptMessageId) {
+      await callApi(token, "deleteMessage", { chat_id: chatId, message_id: ctx.promptMessageId }).catch(() => null);
+    }
+    await callApi(token, "deleteMessage", { chat_id: chatId, message_id: message.message_id }).catch(() => null);
+    if (field === "quote") {
+      draft.props.quote = value;
+      draft.props.title = value;
+    } else if (field === "author") {
+      draft.props.author = value;
+    } else if (field === "role") {
+      draft.props.role = value;
+    } else if (field === "date") {
+      draft.props.date = value;
+      draft.props.meta = value;
+    } else if (field === "background") {
+      draft.props.background = value ? { image: value, dim: 0.62, blur: 0 } : { dim: 0.7 };
+    } else if (field === "logo") {
+      if (/^https?:\/\//i.test(value) || /\.(png|jpe?g|webp|svg)$/i.test(value) || value.includes("/")) {
+        draft.props.logoIcon = value;
+        draft.logoChoices = [];
+      } else {
+        const files = await botContext.listLogoFiles(value, 12).catch(() => []);
+        draft.logoQuery = value;
+        draft.logoChoices = files;
+        if (!files.length) {
+          draft.props.source = value || draft.props.source;
+          draft.props.logoIcon = "";
+        }
+      }
+    }
+    currentSession.remotionCtx = { ...ctx, draft, awaitField: null, promptMessageId: null };
     await saveSession(botContext.DATA_DIR, currentSession);
-    await renderTelegramRemotion(token, chatId, text).catch(() => null);
+    await showRemotionPanel(token, chatId, ctx.panelMessageId || null).catch(() => null);
     return;
   }
 
@@ -3958,17 +4195,18 @@ async function handleTextMessage(token, message) {
 
   if (text.startsWith("/remotion")) {
     const inlineText = text.replace(/^\/remotion(?:@\w+)?\s*/i, "").trim();
-    if (inlineText) {
-      await renderTelegramRemotion(token, chatId, inlineText).catch(() => null);
-      return;
-    }
-    currentSession.remotionCtx = { chatId, createdAt: new Date().toISOString() };
+    currentSession.remotionCtx = {
+      chatId,
+      draft: defaultRemotionDraft(inlineText),
+      awaitField: null,
+      promptMessageId: null,
+      createdAt: new Date().toISOString()
+    };
     await saveSession(botContext.DATA_DIR, currentSession);
-    await callApi(token, "sendMessage", {
-      chat_id: chatId,
-      text: remotionHelpText(),
-      parse_mode: "HTML"
-    });
+    if (!inlineText) {
+      await callApi(token, "sendMessage", { chat_id: chatId, text: remotionHelpText(), parse_mode: "HTML" }).catch(() => null);
+    }
+    await showRemotionPanel(token, chatId);
     return;
   }
 
@@ -4321,6 +4559,135 @@ async function handleCallbackQuery(token, callbackQuery) {
       }).catch(() => null);
     }
     return;
+  }
+
+  if (data.startsWith("sdvg:remotion:")) {
+    const action = data.slice("sdvg:remotion:".length);
+    const ctx = currentSession.remotionCtx || null;
+    if (action.startsWith("font:")) {
+      const [, renderId, direction] = action.match(/^font:([^:]+):([+-])$/) || [];
+      const target = (currentSession.remotionRenders || []).find((item) => item?.id === renderId);
+      if (!target?.body) {
+        await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId, text: "Рендер устарел.", show_alert: true }).catch(() => null);
+        return;
+      }
+      const nextBody = JSON.parse(JSON.stringify(target.body));
+      const currentScale = Number(nextBody.props?.textScale || 1) || 1;
+      nextBody.props.textScale = Math.max(0.72, Math.min(1.38, currentScale + (direction === "+" ? 0.08 : -0.08)));
+      await renderTelegramRemotionBody(token, chatId, nextBody).catch(() => null);
+      return;
+    }
+    if (!ctx?.draft) {
+      await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId, text: "Панель Remotion устарела.", show_alert: true }).catch(() => null);
+      return;
+    }
+    const draft = ctx.draft;
+    if (action === "close") {
+      currentSession.remotionCtx = null;
+      await saveSession(botContext.DATA_DIR, currentSession);
+      await callApi(token, "deleteMessage", { chat_id: chatId, message_id: callbackMessageId }).catch(() => null);
+      return;
+    }
+    if (action === "render") {
+      if (!String(draft.props?.quote || "").trim()) {
+        await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId, text: "Сначала заполните цитату.", show_alert: true }).catch(() => null);
+        return;
+      }
+      await renderTelegramRemotionBody(token, chatId, { format: draft.format, props: draft.props }).catch(() => null);
+      return;
+    }
+    if (action.startsWith("field:")) {
+      const field = action.slice("field:".length);
+      const previousPrompt = ctx.promptMessageId;
+      if (previousPrompt) await callApi(token, "deleteMessage", { chat_id: chatId, message_id: previousPrompt }).catch(() => null);
+      const prompt = await callApi(token, "sendMessage", {
+        chat_id: chatId,
+        text: remotionPromptForField(field)
+      }).catch(() => null);
+      currentSession.remotionCtx = { ...ctx, awaitField: field, promptMessageId: prompt?.message_id || null, panelMessageId: callbackMessageId };
+      await saveSession(botContext.DATA_DIR, currentSession);
+      return;
+    }
+    if (action === "cycle:format") {
+      const index = REMOTION_FORMAT_OPTIONS.indexOf(draft.format);
+      draft.format = REMOTION_FORMAT_OPTIONS[(index + 1 + REMOTION_FORMAT_OPTIONS.length) % REMOTION_FORMAT_OPTIONS.length];
+      draft.props.type = draft.format.startsWith("news-") ? "news" : "quote";
+      currentSession.remotionCtx = { ...ctx, draft, panelMessageId: callbackMessageId };
+      await showRemotionPanel(token, chatId, callbackMessageId);
+      return;
+    }
+    if (action === "cycle:layout") {
+      const index = REMOTION_LAYOUT_OPTIONS.indexOf(String(draft.props.layout || "Left"));
+      draft.props.layout = REMOTION_LAYOUT_OPTIONS[(index + 1 + REMOTION_LAYOUT_OPTIONS.length) % REMOTION_LAYOUT_OPTIONS.length];
+      currentSession.remotionCtx = { ...ctx, draft, panelMessageId: callbackMessageId };
+      await showRemotionPanel(token, chatId, callbackMessageId);
+      return;
+    }
+    if (action.startsWith("logo:")) {
+      const index = Number.parseInt(action.slice("logo:".length), 10);
+      const file = Number.isFinite(index) ? draft.logoChoices?.[index] : null;
+      if (!file?.path) {
+        await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId, text: "Логотип не найден.", show_alert: true }).catch(() => null);
+        return;
+      }
+      draft.props.logoIcon = file.path;
+      draft.props.source = logoLabel(file) || draft.props.source;
+      draft.logoChoices = [];
+      currentSession.remotionCtx = { ...ctx, draft, panelMessageId: callbackMessageId };
+      await showRemotionPanel(token, chatId, callbackMessageId);
+      return;
+    }
+    if (action === "logoText") {
+      draft.props.source = draft.logoQuery || draft.props.source;
+      draft.props.logoIcon = "";
+      draft.logoChoices = [];
+      currentSession.remotionCtx = { ...ctx, draft, panelMessageId: callbackMessageId };
+      await showRemotionPanel(token, chatId, callbackMessageId);
+      return;
+    }
+  }
+
+  if (data.startsWith("sdvg:logo:")) {
+    const action = data.slice("sdvg:logo:".length);
+    const ctx = currentSession.logoPickCtx || null;
+    if (action === "noop") return;
+    if (action === "close") {
+      currentSession.logoPickCtx = null;
+      await saveSession(botContext.DATA_DIR, currentSession);
+      await callApi(token, "deleteMessage", { chat_id: chatId, message_id: callbackMessageId }).catch(() => null);
+      return;
+    }
+    if (!ctx) {
+      await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId, text: "Поиск логотипов устарел.", show_alert: true }).catch(() => null);
+      return;
+    }
+    if (action.startsWith("page:")) {
+      const page = Math.max(0, Number.parseInt(action.slice("page:".length), 10) || 0);
+      await showLogoPicker(token, chatId, ctx.query || "", page, callbackMessageId);
+      return;
+    }
+    if (action.startsWith("sel:")) {
+      const index = Number.parseInt(action.slice("sel:".length), 10);
+      const file = Number.isFinite(index) ? ctx.files?.[index] : null;
+      if (!file?.path) {
+        await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId, text: "Логотип больше не найден.", show_alert: true }).catch(() => null);
+        return;
+      }
+      currentSession.remotionDefaults = {
+        ...(currentSession.remotionDefaults || {}),
+        logoIcon: String(file.path || "").trim(),
+        source: logoLabel(file) || String(file.name || "").replace(/\.[^.]+$/, "")
+      };
+      currentSession.logoPickCtx = null;
+      await saveSession(botContext.DATA_DIR, currentSession);
+      await callApi(token, "editMessageText", {
+        chat_id: chatId,
+        message_id: callbackMessageId,
+        text: `Логотип выбран для Remotion:\n<b>${escapeHtml(currentSession.remotionDefaults.source)}</b>\n<code>${escapeHtml(currentSession.remotionDefaults.logoIcon)}</code>\n\nТеперь можно вызвать <code>/remotion текст</code> или отправить расширенную форму.`,
+        parse_mode: "HTML"
+      }).catch(() => null);
+      return;
+    }
   }
 
   if (data.startsWith("sdvg:folder:")) {

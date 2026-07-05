@@ -27,6 +27,8 @@ const remotionAuthorInput = document.querySelector("#remotion-author");
 const remotionRoleInput = document.querySelector("#remotion-role");
 const remotionLogoInput = document.querySelector("#remotion-logo");
 const remotionBackgroundInput = document.querySelector("#remotion-background");
+const remotionLogoSearchInput = document.querySelector("#remotion-logo-search");
+const remotionLogoResultsEl = document.querySelector("#remotion-logo-results");
 const remotionRenderButton = document.querySelector("#remotion-render-button");
 const themeToggleButton = document.querySelector("#theme-toggle");
 const searchDialogEl = document.querySelector("#search-dialog");
@@ -49,6 +51,7 @@ let rssCandidates = {};
 let rssLoading = false;
 let segmentSearch = null;
 let pendingSearchDialog = null;
+let remotionLogoSearchTimer = null;
 
 function setStatus(message) {
   statusEl.textContent = message;
@@ -870,6 +873,29 @@ function renderMediaFileButton(file, isTopicFile) {
   `;
 }
 
+function renderLogoSearchResults(files) {
+  if (!remotionLogoResultsEl) return;
+  const items = Array.isArray(files) ? files : [];
+  if (!items.length) {
+    remotionLogoResultsEl.innerHTML = '<p class="empty">Логотипы не найдены.</p>';
+    return;
+  }
+  remotionLogoResultsEl.innerHTML = items.slice(0, 18).map((file) => `
+    <button type="button" data-logo-path="${escapeHtml(file.path)}" data-logo-label="${escapeHtml(file.label || file.name || "")}">
+      <img src="${escapeHtml(file.thumbnail || mediaRawUrl(file.path))}" alt="" loading="lazy" />
+      <span>${escapeHtml(file.label || file.name || file.path)}</span>
+    </button>
+  `).join("");
+}
+
+async function searchRemotionLogos(query = "") {
+  if (!remotionLogoResultsEl) return;
+  const response = await fetch(`/api/logos?q=${encodeURIComponent(query || "")}`);
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "Logo search failed");
+  renderLogoSearchResults(data.files || []);
+}
+
 async function loadMediaLibrary(topic) {
   mediaPickerListEl.innerHTML = '<p class="empty">Loading media...</p>';
   const response = await fetch(`/api/media?topic=${encodeURIComponent(topic || "")}`);
@@ -899,7 +925,10 @@ async function openMediaPicker(segmentId) {
   remotionRoleInput.value = "";
   remotionLogoInput.value = "";
   remotionBackgroundInput.value = "";
+  remotionLogoSearchInput.value = "";
+  remotionLogoResultsEl.innerHTML = "";
   mediaPickerEl.hidden = false;
+  await searchRemotionLogos("").catch(() => null);
   await loadMediaLibrary(activeMediaTopic).catch((error) => {
     mediaPickerListEl.innerHTML = `<p class="empty">${escapeHtml(error.message || "Media list failed")}</p>`;
   });
@@ -917,6 +946,8 @@ function closeMediaPicker() {
   remotionRoleInput.value = "";
   remotionLogoInput.value = "";
   remotionBackgroundInput.value = "";
+  remotionLogoSearchInput.value = "";
+  remotionLogoResultsEl.innerHTML = "";
   mediaDownloadStatusEl.textContent = "";
   if (activeDownloadPoll) {
     clearTimeout(activeDownloadPoll);
@@ -1195,6 +1226,27 @@ mediaPickerListEl.addEventListener("click", async (event) => {
     thumbnail: button.querySelector("img")?.getAttribute("src") || ""
   });
   closeMediaPicker();
+});
+
+remotionLogoSearchInput.addEventListener("input", () => {
+  clearTimeout(remotionLogoSearchTimer);
+  remotionLogoSearchTimer = setTimeout(() => {
+    void searchRemotionLogos(remotionLogoSearchInput.value.trim()).catch((error) => {
+      remotionLogoResultsEl.innerHTML = `<p class="empty">${escapeHtml(error.message || "Logo search failed")}</p>`;
+    });
+  }, 180);
+});
+
+remotionLogoResultsEl.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-logo-path]");
+  if (!button) return;
+  const logoPath = button.dataset.logoPath || "";
+  const logoLabel = button.dataset.logoLabel || "";
+  remotionLogoInput.value = logoPath;
+  if (logoLabel && (!remotionSourceInput.value || remotionSourceInput.value === activeMediaTopic)) {
+    remotionSourceInput.value = logoLabel;
+  }
+  setMediaDownloadStatus(`Лого: ${logoPath}`);
 });
 
 mediaPickerCloseButton.addEventListener("click", closeMediaPicker);

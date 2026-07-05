@@ -79,8 +79,10 @@
           <input id="remotion-role" type="text" placeholder="Должность автора" autocomplete="off" />
           <input id="remotion-logo" type="text" placeholder="Логотип: путь или URL" autocomplete="off" />
           <input id="remotion-background" type="text" placeholder="Фон: фото/видео путь или URL" autocomplete="off" />
+          <input id="remotion-logo-search" type="search" placeholder="Поиск логотипа в media/logos" autocomplete="off" />
           <button id="remotion-render-button" type="submit">Render</button>
-          <div class="remotion-hint">Выберите фон или логотип кнопками у файлов ниже.</div>
+          <div id="remotion-logo-results" class="remotion-logo-results"></div>
+          <div class="remotion-hint">Логотипы храните в media/logos: PNG/WebP/SVG с прозрачностью, 1024x1024+ для знака или 2400px+ по ширине для горизонтального лого.</div>
         </form>
         <div id="media-download-status" class="media-download-status"></div>
         <div id="media-picker-list" class="media-picker-list"></div>
