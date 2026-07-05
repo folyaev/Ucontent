@@ -761,15 +761,33 @@ button:disabled {
 
 .remotion-render-form {
   display: grid;
-  grid-template-columns: minmax(110px, 0.8fr) minmax(0, 1fr) minmax(0, 1fr) auto;
+  grid-template-columns: minmax(115px, 0.7fr) repeat(3, minmax(0, 1fr)) auto;
   gap: 8px;
   padding: 10px 12px;
   border-bottom: 1px solid var(--line);
 }
 
 .remotion-render-form select,
-.remotion-render-form input {
+.remotion-render-form input,
+.remotion-render-form textarea {
   min-width: 0;
+}
+
+.remotion-render-form textarea {
+  grid-column: 1 / -1;
+  min-height: 82px;
+  resize: vertical;
+}
+
+.remotion-render-form #remotion-logo,
+.remotion-render-form #remotion-background {
+  grid-column: span 2;
+}
+
+.remotion-hint {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .media-download-fallback {
@@ -798,8 +816,21 @@ button:disabled {
     grid-template-columns: 1fr 1fr;
   }
 
+  .remotion-render-form #remotion-logo,
+  .remotion-render-form #remotion-background {
+    grid-column: 1 / -1;
+  }
+
   .remotion-render-form button {
     grid-column: 1 / -1;
+  }
+
+  .media-file-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .media-file-actions {
+    grid-template-columns: 1fr 1fr;
   }
 }
 
@@ -823,12 +854,31 @@ button:disabled {
   grid-template-columns: 58px minmax(0, 1fr);
   gap: 9px;
   align-items: center;
+  width: 100%;
   min-height: 58px;
   padding: 6px;
   border-color: var(--line);
   background: var(--paper);
   color: var(--ink);
   text-align: left;
+}
+
+.media-file-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+}
+
+.media-file-actions {
+  display: grid;
+  gap: 6px;
+  align-content: stretch;
+}
+
+.media-file-actions button {
+  min-height: 0;
+  padding: 6px 9px;
+  font-size: 12px;
 }
 
 .media-file-option:hover {

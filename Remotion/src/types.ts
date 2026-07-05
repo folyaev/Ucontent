@@ -35,6 +35,7 @@ export type QuoteVideoProps = {
   
   background?: {
     image?: string;
+    video?: string;
     blur?: number;
     dim?: number;
   };

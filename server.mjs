@@ -40,6 +40,7 @@ await loadEnv(__dirname);
 await loadEnv(path.join(__dirname, ".."));
 
 const PORT = Number(process.env.UCONTENT_PORT || 5197);
+const UCONTENT_SELF_URL = (process.env.UCONTENT_SELF_URL || `http://127.0.0.1:${PORT}`).replace(/\/$/, "");
 const DATA_DIR = path.join(__dirname, "data", "scrapes");
 const HISTORY_DIR = path.join(DATA_DIR, "history");
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -2935,9 +2936,35 @@ function cleanRemotionText(value, maxLength = 1200) {
   return String(value ?? "").replace(/\s+/g, " ").trim().slice(0, maxLength);
 }
 
+function cleanRemotionLongText(value, maxLength = 1800) {
+  return String(value ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim().slice(0, maxLength);
+}
+
+function remotionMediaAssetRef(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  if (/^https?:\/\//i.test(raw)) return raw;
+  let relPath = raw;
+  try {
+    const parsed = new URL(raw, `http://127.0.0.1:${PORT}`);
+    if (parsed.pathname === "/api/media/raw") {
+      relPath = parsed.searchParams.get("path") || "";
+    } else if (/^https?:\/\//i.test(raw)) {
+      return raw;
+    }
+  } catch {
+    // keep raw value
+  }
+  relPath = relPath.replace(/^\/+/, "").replace(/^media\//i, "");
+  if (!relPath) return "";
+  if (!/[\\/]/.test(relPath) && !/\.[a-z0-9]{2,5}$/i.test(relPath)) return "";
+  safeResolveMediaPathForRoot(PAMPAM_ROOT, relPath);
+  return `${UCONTENT_SELF_URL}/api/media/raw?path=${encodeURIComponent(relPath)}`;
+}
+
 function buildRemotionProps(body = {}) {
   const props = body.props && typeof body.props === "object" && !Array.isArray(body.props) ? body.props : {};
-  const quote = cleanRemotionText(props.quote || props.title || body.quote || body.title, 1400);
+  const quote = cleanRemotionLongText(props.quote || props.title || body.quote || body.title, 1800);
   const source = cleanRemotionText(props.source || props.logo || body.source || body.logo, 80);
   const author = cleanRemotionText(props.author || body.author, 120);
   const role = cleanRemotionText(props.role || body.role, 180);
@@ -2951,9 +2978,12 @@ function buildRemotionProps(body = {}) {
     ? {
         dim: Number.isFinite(Number(props.background.dim)) ? Math.max(0, Math.min(1, Number(props.background.dim))) : undefined,
         blur: Number.isFinite(Number(props.background.blur)) ? Math.max(0, Math.min(80, Number(props.background.blur))) : undefined,
-        image: cleanRemotionText(props.background.image, 600) || undefined
+        image: remotionMediaAssetRef(props.background.image || props.background.video) || cleanRemotionText(props.background.image || props.background.video, 600) || undefined
       }
     : undefined;
+  const avatar = remotionMediaAssetRef(props.avatar || body.avatar) || cleanRemotionText(props.avatar || body.avatar, 600);
+  const logoIcon = remotionMediaAssetRef(props.logoIcon || props.logo_icon || body.logoIcon || body.logo_icon) ||
+    cleanRemotionText(props.logoIcon || props.logo_icon || body.logoIcon || body.logo_icon, 600);
   return {
     variant: cleanRemotionText(props.variant || body.variant, 40) || "editorial",
     ...(type ? { type } : {}),
@@ -2968,32 +2998,33 @@ function buildRemotionProps(body = {}) {
     label,
     accent,
     transparent,
+    ...(avatar ? { avatar } : {}),
+    ...(logoIcon ? { logoIcon } : {}),
     ...(background ? { background } : { background: { dim: 0.7 } })
   };
 }
 
-async function handleRemotionRender(req, res) {
-  const body = await readBody(req);
+async function renderRemotionCard(body = {}) {
   const format = String(body.format || "quote-1x1").trim();
   const preset = REMOTION_PRESETS.get(format);
   if (!preset) {
-    json(res, 400, { error: "Unsupported Remotion format" });
-    return;
+    const error = new Error("Unsupported Remotion format");
+    error.statusCode = 400;
+    throw error;
   }
   const props = buildRemotionProps(body);
   if (!props.quote) {
-    json(res, 400, { error: "quote/title is required" });
-    return;
+    const error = new Error("quote/title is required");
+    error.statusCode = 400;
+    throw error;
   }
   const scriptPath = path.join(REMOTION_ROOT, "scripts", "render.mjs");
   if (!(await pathExists(scriptPath))) {
-    json(res, 500, { error: "Remotion render script is unavailable" });
-    return;
+    throw new Error("Remotion render script is unavailable");
   }
   const nodeModulesPath = path.join(REMOTION_ROOT, "node_modules");
   if (!(await pathExists(nodeModulesPath))) {
-    json(res, 500, { error: "Remotion dependencies are not installed" });
-    return;
+    throw new Error("Remotion dependencies are not installed");
   }
 
   const graphicsDir = path.join(PAMPAM_ROOT, "graphics");
@@ -3034,12 +3065,21 @@ async function handleRemotionRender(req, res) {
       format_note: format,
       size: stats.size
     });
-    json(res, 200, { file, props, format });
+    return { file, props, format };
   } catch (error) {
     await fs.unlink(outputPath).catch(() => null);
-    json(res, 500, { error: `Remotion render failed: ${error.message}` });
+    throw new Error(`Remotion render failed: ${error.message}`);
   } finally {
     await fs.unlink(propsPath).catch(() => null);
+  }
+}
+
+async function handleRemotionRender(req, res) {
+  try {
+    const body = await readBody(req);
+    json(res, 200, await renderRemotionCard(body));
+  } catch (error) {
+    json(res, error.statusCode || 500, { error: error.message || "Remotion render failed" });
   }
 }
 
@@ -3510,6 +3550,7 @@ server.listen(PORT, () => {
     upsertMediaMetadata: MEDIA_INDEX.upsert,
     moveMediaMetadata: MEDIA_INDEX.move,
     listMediaMetadata: MEDIA_INDEX.entries,
+    renderRemotionCard,
     resolveDownloaderTools,
     convertWebpToPng: convertWebpFileToPng,
     spawn,

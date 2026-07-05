@@ -61,6 +61,7 @@ async function loadSession(dataDir) {
       screenshotTargets: [],
       folderMoveContexts: {},
       folderCreateCtx: null,
+      remotionCtx: null,
       cutJobs: {},
       trimJobs: {},
       trimInputCtx: null,
@@ -79,6 +80,7 @@ async function loadSession(dataDir) {
     ? currentSession.folderMoveContexts
     : {};
   currentSession.folderCreateCtx = currentSession.folderCreateCtx || null;
+  currentSession.remotionCtx = currentSession.remotionCtx || null;
   currentSession.renameCtx = currentSession.renameCtx || null;
   currentSession.cutJobs = currentSession.cutJobs && typeof currentSession.cutJobs === "object" ? currentSession.cutJobs : {};
   currentSession.trimJobs = currentSession.trimJobs && typeof currentSession.trimJobs === "object" ? currentSession.trimJobs : {};
@@ -1573,6 +1575,128 @@ async function enqueueUnsortedDownloads(token, chatId, urls, sourceMessageId = n
   void runUnsortedDownloadQueue(token, chatId).catch((error) => {
     console.error(`[download-queue] ${chatId}: ${error.message}`);
   });
+}
+
+const REMOTION_FORMATS = new Set([
+  "quote-1x1",
+  "quote-2x1",
+  "news-1x1",
+  "news-2x1",
+  "quote-1x1-alpha",
+  "quote-2x1-alpha",
+  "news-1x1-alpha",
+  "news-2x1-alpha"
+]);
+
+function remotionHelpText() {
+  return [
+    "<b>Remotion</b>",
+    "Пришлите текст для карточки или заполните поля:",
+    "",
+    "Текст: нужный заголовок или цитата",
+    "Автор: Имя Фамилия",
+    "Должность: редактор / CEO / источник",
+    "Лого: graphics/logo.png или URL",
+    "Фон: graphics/bg.mp4 или URL",
+    "Формат: quote-1x1",
+    "",
+    "Быстро: <code>/remotion Текст карточки</code>"
+  ].join("\n");
+}
+
+function parseRemotionMessage(text) {
+  const lines = String(text || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  const fields = {};
+  let currentKey = "";
+  const keyMap = new Map([
+    ["текст", "quote"], ["цитата", "quote"], ["заголовок", "quote"], ["quote", "quote"], ["text", "quote"], ["title", "quote"],
+    ["автор", "author"], ["author", "author"],
+    ["должность", "role"], ["роль", "role"], ["role", "role"], ["position", "role"],
+    ["лого", "logoIcon"], ["логотип", "logoIcon"], ["logo", "logoIcon"], ["logoicon", "logoIcon"],
+    ["издание", "source"], ["источник", "source"], ["source", "source"],
+    ["фон", "background"], ["background", "background"], ["bg", "background"],
+    ["формат", "format"], ["format", "format"]
+  ]);
+
+  for (const line of lines) {
+    const match = line.match(/^\s*([^:：]{2,24})\s*[:：]\s*(.*)$/);
+    const mapped = match ? keyMap.get(match[1].trim().toLowerCase()) : "";
+    if (mapped) {
+      currentKey = mapped;
+      fields[currentKey] = match[2] || "";
+      continue;
+    }
+    if (currentKey && ["quote", "role"].includes(currentKey)) {
+      fields[currentKey] = `${fields[currentKey] ? `${fields[currentKey]}\n` : ""}${line}`.trim();
+    }
+  }
+
+  const hasKnownFields = Object.keys(fields).length > 0;
+  const quote = hasKnownFields ? String(fields.quote || "").trim() : String(text || "").trim();
+  const format = REMOTION_FORMATS.has(String(fields.format || "").trim()) ? String(fields.format).trim() : "quote-1x1";
+  return {
+    format,
+    props: {
+      type: format.startsWith("news-") ? "news" : "quote",
+      source: String(fields.source || "UContent").trim(),
+      quote,
+      title: quote,
+      author: String(fields.author || "").trim(),
+      role: String(fields.role || "").trim(),
+      logoIcon: String(fields.logoIcon || "").trim(),
+      accent: "#f0b24c",
+      background: String(fields.background || "").trim()
+        ? { image: String(fields.background).trim(), dim: 0.62, blur: 0 }
+        : { dim: 0.7 }
+    }
+  };
+}
+
+async function renderTelegramRemotion(token, chatId, text) {
+  if (!botContext?.renderRemotionCard) throw new Error("Remotion renderer is unavailable");
+  const body = parseRemotionMessage(text);
+  if (!body.props.quote) throw new Error("Нужен текст заголовка или цитаты");
+  const statusMsg = await callApi(token, "sendMessage", {
+    chat_id: chatId,
+    text: "Рендерю Remotion-карточку..."
+  });
+  try {
+    const result = await botContext.renderRemotionCard(body);
+    const relPath = result?.file?.path || "";
+    const filePath = relPath ? path.join(botContext.PAMPAM_ROOT, relPath.replace(/\//g, path.sep)) : "";
+    const stats = filePath ? await fs.stat(filePath).catch(() => null) : null;
+    if (!filePath || !stats?.isFile?.()) throw new Error("Готовый файл не найден");
+    const renameId = rememberRenameTarget(relPath, "", -1, "");
+    const caption = buildReturnedMediaCaption({
+      fileName: result.file.name || path.basename(filePath),
+      sourceUrl: "",
+      sizeBytes: stats.size,
+      metadata: {
+        title: body.props.quote,
+        description: body.props.quote,
+        uploader: body.props.author || body.props.source,
+        format_note: body.format
+      }
+    });
+    const sentMessage = await sendLocalMedia(token, {
+      chat_id: chatId,
+      caption,
+      parse_mode: "HTML",
+      reply_markup: renameButtonMarkup(renameId)
+    }, filePath, safeTelegramUploadFileName(result.file.name || path.basename(filePath), "remotion.mp4"));
+    if (sentMessage?.message_id && attachRenameTargetMessage(renameId, chatId, sentMessage.message_id)) {
+      await saveSession(botContext.DATA_DIR, currentSession);
+    }
+    await callApi(token, "deleteMessage", { chat_id: chatId, message_id: statusMsg.message_id }).catch(() => null);
+    return result;
+  } catch (error) {
+    await callApi(token, "editMessageText", {
+      chat_id: chatId,
+      message_id: statusMsg.message_id,
+      text: `Не удалось сгенерировать Remotion: ${error.message}`
+    }).catch(() => null);
+    throw error;
+  }
 }
 
 async function sendActiveScrapeXml(token, chatId) {
@@ -3796,6 +3920,13 @@ async function handleTextMessage(token, message) {
     }
   }
 
+  if (currentSession.remotionCtx && !text.startsWith("/")) {
+    currentSession.remotionCtx = null;
+    await saveSession(botContext.DATA_DIR, currentSession);
+    await renderTelegramRemotion(token, chatId, text).catch(() => null);
+    return;
+  }
+
   if (text.startsWith("/start") || text.startsWith("/help")) {
     await callApi(token, "sendMessage", {
       chat_id: chatId,
@@ -3811,6 +3942,7 @@ async function handleTextMessage(token, message) {
         "• /notion — обновить активный сценарий из Notion",
         "• /download — качать ссылки в unsorted без SDVG",
         "• /app — открыть активный сценарий в веб-приложении",
+        "• /remotion — сгенерировать Remotion-карточку",
         "• /xml — скачать XML активного сценария",
         "• /figma — список всех тем активного сценария",
         "• /figmamin — только названия тем",
@@ -3819,6 +3951,22 @@ async function handleTextMessage(token, message) {
         "💡 Текстовое сообщение при активном сегменте создаёт новый сегмент-указание.",
         "Также вы можете нажать кнопку <b>TG</b> в веб-интерфейсе UContent, чтобы отправить нужный сценарий сюда."
       ].join("\n"),
+      parse_mode: "HTML"
+    });
+    return;
+  }
+
+  if (text.startsWith("/remotion")) {
+    const inlineText = text.replace(/^\/remotion(?:@\w+)?\s*/i, "").trim();
+    if (inlineText) {
+      await renderTelegramRemotion(token, chatId, inlineText).catch(() => null);
+      return;
+    }
+    currentSession.remotionCtx = { chatId, createdAt: new Date().toISOString() };
+    await saveSession(botContext.DATA_DIR, currentSession);
+    await callApi(token, "sendMessage", {
+      chat_id: chatId,
+      text: remotionHelpText(),
       parse_mode: "HTML"
     });
     return;

@@ -2,6 +2,7 @@ import {
   AbsoluteFill,
   Img,
   interpolate,
+  OffthreadVideo,
   spring,
   staticFile,
   useCurrentFrame,
@@ -12,6 +13,8 @@ import {colors, fontStack} from '../design/tokens';
 import type {QuoteVideoProps} from '../types';
 
 const clean = (value: string | undefined) => String(value ?? '').trim();
+const isVideoAsset = (value: string | undefined) =>
+  /\.(mp4|mov|m4v|webm|mkv)(?:$|[?#])/i.test(clean(value));
 
 // Dynamic font scaling metrics to keep both short and long text visually balanced
 const getNews2x1Metrics = (text: string, scale: number) => {
@@ -101,16 +104,30 @@ const Background = ({
   return (
     <AbsoluteFill style={{backgroundColor: colors.black, overflow: 'hidden'}}>
       {image ? (
-        <Img
-          src={image}
-          style={{
-            width: '100%',
-            height: '100%',
-            objectFit: 'cover',
-            filter: blur > 0 ? `blur(${blur}px)` : undefined,
-            transform: `scale(${zoom * (blur > 0 ? 1.04 : 1.0)})`,
-          }}
-        />
+        isVideoAsset(image) ? (
+          <OffthreadVideo
+            src={image}
+            muted
+            style={{
+              width: '100%',
+              height: '100%',
+              objectFit: 'cover',
+              filter: blur > 0 ? `blur(${blur}px)` : undefined,
+              transform: `scale(${zoom * (blur > 0 ? 1.04 : 1.0)})`,
+            }}
+          />
+        ) : (
+          <Img
+            src={image}
+            style={{
+              width: '100%',
+              height: '100%',
+              objectFit: 'cover',
+              filter: blur > 0 ? `blur(${blur}px)` : undefined,
+              transform: `scale(${zoom * (blur > 0 ? 1.04 : 1.0)})`,
+            }}
+          />
+        )
       ) : (
         <div
           style={{

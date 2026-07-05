@@ -20,9 +20,13 @@ const mediaDownloadButton = document.querySelector("#media-download-button");
 const mediaDownloadStatusEl = document.querySelector("#media-download-status");
 const mediaDownloadFallbackScreenshotInput = document.querySelector("#media-download-fallback-screenshot");
 const remotionRenderForm = document.querySelector("#remotion-render-form");
+const remotionQuoteInput = document.querySelector("#remotion-quote");
 const remotionFormatInput = document.querySelector("#remotion-format");
 const remotionSourceInput = document.querySelector("#remotion-source");
 const remotionAuthorInput = document.querySelector("#remotion-author");
+const remotionRoleInput = document.querySelector("#remotion-role");
+const remotionLogoInput = document.querySelector("#remotion-logo");
+const remotionBackgroundInput = document.querySelector("#remotion-background");
 const remotionRenderButton = document.querySelector("#remotion-render-button");
 const themeToggleButton = document.querySelector("#theme-toggle");
 const searchDialogEl = document.querySelector("#search-dialog");
@@ -850,13 +854,19 @@ function mediaFileFromTransfer(dataTransfer) {
 function renderMediaFileButton(file, isTopicFile) {
   const thumb = file.thumbnail ? `<img src="${escapeHtml(file.thumbnail)}" alt="" loading="lazy" />` : '<span class="media-file-icon">file</span>';
   return `
-    <button class="media-file-option${isTopicFile ? " is-topic" : ""}" type="button" data-media-path="${escapeHtml(file.path)}">
-      ${thumb}
-      <span>
-        <strong>${escapeHtml(file.name || file.path)}</strong>
-        <em>${escapeHtml(file.path || "")}</em>
-      </span>
-    </button>
+    <div class="media-file-row${isTopicFile ? " is-topic" : ""}">
+      <button class="media-file-option" type="button" data-media-path="${escapeHtml(file.path)}">
+        ${thumb}
+        <span>
+          <strong>${escapeHtml(file.name || file.path)}</strong>
+          <em>${escapeHtml(file.path || "")}</em>
+        </span>
+      </button>
+      <div class="media-file-actions">
+        <button type="button" data-remotion-bg="${escapeHtml(file.path)}">Фон</button>
+        <button type="button" data-remotion-logo="${escapeHtml(file.path)}">Лого</button>
+      </div>
+    </div>
   `;
 }
 
@@ -883,8 +893,12 @@ async function openMediaPicker(segmentId) {
   if (!segment) return;
   activeMediaSegmentId = segmentId;
   activeMediaTopic = segment.topic || "";
+  remotionQuoteInput.value = "";
   remotionSourceInput.value = segment.topic || "";
   remotionAuthorInput.value = "";
+  remotionRoleInput.value = "";
+  remotionLogoInput.value = "";
+  remotionBackgroundInput.value = "";
   mediaPickerEl.hidden = false;
   await loadMediaLibrary(activeMediaTopic).catch((error) => {
     mediaPickerListEl.innerHTML = `<p class="empty">${escapeHtml(error.message || "Media list failed")}</p>`;
@@ -897,8 +911,12 @@ function closeMediaPicker() {
   activeMediaTopic = "";
   mediaUploadInput.value = "";
   mediaDownloadUrlInput.value = "";
+  remotionQuoteInput.value = "";
   remotionSourceInput.value = "";
   remotionAuthorInput.value = "";
+  remotionRoleInput.value = "";
+  remotionLogoInput.value = "";
+  remotionBackgroundInput.value = "";
   mediaDownloadStatusEl.textContent = "";
   if (activeDownloadPoll) {
     clearTimeout(activeDownloadPoll);
@@ -971,22 +989,16 @@ async function downloadMediaUrl(url) {
   await pollMediaDownload(data.job.id);
 }
 
-function remotionQuoteFromSegment(segment) {
-  return String(segment?.text || "")
-    .replace(/^https?:\/\/\S+$/i, "")
-    .replace(/^\/+/, "")
-    .trim() || String(segment?.topic || "").trim();
-}
-
 async function renderRemotionForActiveSegment() {
   const segment = segmentById(activeMediaSegmentId);
   if (!segment) return;
-  const quote = remotionQuoteFromSegment(segment);
-  if (!quote) throw new Error("Segment text is empty");
+  const quote = remotionQuoteInput.value.trim();
+  if (!quote) throw new Error("Заполните заголовок или цитату");
   remotionRenderButton.disabled = true;
   setMediaDownloadStatus("Rendering Remotion card...");
   const format = remotionFormatInput.value || "quote-1x1";
   const isNews = format.startsWith("news-");
+  const backgroundValue = remotionBackgroundInput.value.trim();
   const response = await fetch("/api/remotion/render", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -998,9 +1010,11 @@ async function renderRemotionForActiveSegment() {
         quote,
         title: quote,
         author: remotionAuthorInput.value || "",
+        role: remotionRoleInput.value || "",
+        logoIcon: remotionLogoInput.value || "",
         label: isNews ? "News" : "Quote",
         accent: "#f0b24c",
-        background: { dim: 0.7 }
+        background: backgroundValue ? { image: backgroundValue, dim: 0.62, blur: 0 } : { dim: 0.7 }
       }
     })
   });
@@ -1161,6 +1175,18 @@ document.addEventListener("paste", async (event) => {
 });
 
 mediaPickerListEl.addEventListener("click", async (event) => {
+  const bgButton = event.target.closest("button[data-remotion-bg]");
+  if (bgButton) {
+    remotionBackgroundInput.value = bgButton.dataset.remotionBg || "";
+    setMediaDownloadStatus(`Фон: ${remotionBackgroundInput.value}`);
+    return;
+  }
+  const logoButton = event.target.closest("button[data-remotion-logo]");
+  if (logoButton) {
+    remotionLogoInput.value = logoButton.dataset.remotionLogo || "";
+    setMediaDownloadStatus(`Лого: ${remotionLogoInput.value}`);
+    return;
+  }
   const button = event.target.closest("button[data-media-path]");
   if (!button || !activeMediaSegmentId) return;
   await addMediaToSegment(activeMediaSegmentId, {
