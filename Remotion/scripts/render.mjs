@@ -34,6 +34,11 @@ const presets = {
     output: 'out/generated-news-2x1-alpha.webm',
     args: ['--codec=vp8', '--pixel-format=yuva420p', '--image-format=png'],
   },
+  'news-2x1-alpha-mov': {
+    composition: 'News2x1Alpha-Target',
+    output: 'out/generated-news-2x1-alpha.mov',
+    args: ['--codec=prores', '--prores-profile=4444', '--pixel-format=yuva444p10le', '--image-format=png'],
+  },
   'news-1x1': {
     composition: 'News1x1-Target',
     output: 'out/generated-news-1x1.mp4',
@@ -43,6 +48,11 @@ const presets = {
     composition: 'News1x1Alpha-Target',
     output: 'out/generated-news-1x1-alpha.webm',
     args: ['--codec=vp8', '--pixel-format=yuva420p', '--image-format=png'],
+  },
+  'news-1x1-alpha-mov': {
+    composition: 'News1x1Alpha-Target',
+    output: 'out/generated-news-1x1-alpha.mov',
+    args: ['--codec=prores', '--prores-profile=4444', '--pixel-format=yuva444p10le', '--image-format=png'],
   },
   'quote-2x1': {
     composition: 'Quote2x1-Target',
@@ -54,6 +64,11 @@ const presets = {
     output: 'out/generated-quote-2x1-alpha.webm',
     args: ['--codec=vp8', '--pixel-format=yuva420p', '--image-format=png'],
   },
+  'quote-2x1-alpha-mov': {
+    composition: 'Quote2x1Alpha-Target',
+    output: 'out/generated-quote-2x1-alpha.mov',
+    args: ['--codec=prores', '--prores-profile=4444', '--pixel-format=yuva444p10le', '--image-format=png'],
+  },
   'quote-1x1': {
     composition: 'Quote1x1-Target',
     output: 'out/generated-quote-1x1.mp4',
@@ -63,6 +78,11 @@ const presets = {
     composition: 'Quote1x1Alpha-Target',
     output: 'out/generated-quote-1x1-alpha.webm',
     args: ['--codec=vp8', '--pixel-format=yuva420p', '--image-format=png'],
+  },
+  'quote-1x1-alpha-mov': {
+    composition: 'Quote1x1Alpha-Target',
+    output: 'out/generated-quote-1x1-alpha.mov',
+    args: ['--codec=prores', '--prores-profile=4444', '--pixel-format=yuva444p10le', '--image-format=png'],
   },
 };
 

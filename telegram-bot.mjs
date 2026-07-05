@@ -1593,10 +1593,27 @@ const REMOTION_FORMATS = new Set([
   "quote-1x1-alpha",
   "quote-2x1-alpha",
   "news-1x1-alpha",
-  "news-2x1-alpha"
+  "news-2x1-alpha",
+  "quote-1x1-alpha-mov",
+  "quote-2x1-alpha-mov",
+  "news-1x1-alpha-mov",
+  "news-2x1-alpha-mov"
 ]);
 
-const REMOTION_FORMAT_OPTIONS = ["quote-1x1", "quote-2x1", "news-1x1", "news-2x1"];
+const REMOTION_FORMAT_OPTIONS = [
+  "quote-1x1",
+  "quote-2x1",
+  "news-1x1",
+  "news-2x1",
+  "quote-1x1-alpha",
+  "quote-2x1-alpha",
+  "news-1x1-alpha",
+  "news-2x1-alpha",
+  "quote-1x1-alpha-mov",
+  "quote-2x1-alpha-mov",
+  "news-1x1-alpha-mov",
+  "news-2x1-alpha-mov"
+];
 const REMOTION_LAYOUT_OPTIONS = ["Left", "Center", "Wide", "TL", "BL"];
 const REMOTION_FIELD_LABELS = {
   quote: "цитату / заголовок",

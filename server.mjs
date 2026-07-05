@@ -2994,12 +2994,16 @@ async function handleCheckGraphics(reqUrl, res) {
 const REMOTION_PRESETS = new Map([
   ["news-2x1", { ext: ".mp4" }],
   ["news-2x1-alpha", { ext: ".webm" }],
+  ["news-2x1-alpha-mov", { ext: ".mov" }],
   ["news-1x1", { ext: ".mp4" }],
   ["news-1x1-alpha", { ext: ".webm" }],
+  ["news-1x1-alpha-mov", { ext: ".mov" }],
   ["quote-2x1", { ext: ".mp4" }],
   ["quote-2x1-alpha", { ext: ".webm" }],
+  ["quote-2x1-alpha-mov", { ext: ".mov" }],
   ["quote-1x1", { ext: ".mp4" }],
-  ["quote-1x1-alpha", { ext: ".webm" }]
+  ["quote-1x1-alpha", { ext: ".webm" }],
+  ["quote-1x1-alpha-mov", { ext: ".mov" }]
 ]);
 
 function cleanRemotionText(value, maxLength = 1200) {
@@ -3087,6 +3091,7 @@ async function renderRemotionCard(body = {}) {
     throw error;
   }
   const props = buildRemotionProps(body);
+  if (format.includes("-alpha")) props.transparent = true;
   if (!props.quote) {
     const error = new Error("quote/title is required");
     error.statusCode = 400;
