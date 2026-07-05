@@ -23,64 +23,64 @@ const presets = {
     output: 'out/generated-1x1-alpha.webm',
     args: ['--codec=vp8', '--pixel-format=yuva420p', '--image-format=png'],
   },
-  // Target / 1x Resolution (1920x960 and 960x960)
+  // UContent production formats: high resolution only.
   'news-2x1': {
-    composition: 'News2x1-Target',
+    composition: 'News2x1',
     output: 'out/generated-news-2x1.mp4',
     args: ['--codec=h264', '--crf=16'],
   },
   'news-2x1-alpha': {
-    composition: 'News2x1Alpha-Target',
+    composition: 'News2x1Alpha',
     output: 'out/generated-news-2x1-alpha.webm',
     args: ['--codec=vp8', '--pixel-format=yuva420p', '--image-format=png'],
   },
   'news-2x1-alpha-mov': {
-    composition: 'News2x1Alpha-Target',
+    composition: 'News2x1Alpha',
     output: 'out/generated-news-2x1-alpha.mov',
     args: ['--codec=prores', '--prores-profile=4444', '--pixel-format=yuva444p10le', '--image-format=png'],
   },
   'news-1x1': {
-    composition: 'News1x1-Target',
+    composition: 'News1x1',
     output: 'out/generated-news-1x1.mp4',
     args: ['--codec=h264', '--crf=16'],
   },
   'news-1x1-alpha': {
-    composition: 'News1x1Alpha-Target',
+    composition: 'News1x1Alpha',
     output: 'out/generated-news-1x1-alpha.webm',
     args: ['--codec=vp8', '--pixel-format=yuva420p', '--image-format=png'],
   },
   'news-1x1-alpha-mov': {
-    composition: 'News1x1Alpha-Target',
+    composition: 'News1x1Alpha',
     output: 'out/generated-news-1x1-alpha.mov',
     args: ['--codec=prores', '--prores-profile=4444', '--pixel-format=yuva444p10le', '--image-format=png'],
   },
   'quote-2x1': {
-    composition: 'Quote2x1-Target',
+    composition: 'Quote2x1',
     output: 'out/generated-quote-2x1.mp4',
     args: ['--codec=h264', '--crf=16'],
   },
   'quote-2x1-alpha': {
-    composition: 'Quote2x1Alpha-Target',
+    composition: 'Quote2x1Alpha',
     output: 'out/generated-quote-2x1-alpha.webm',
     args: ['--codec=vp8', '--pixel-format=yuva420p', '--image-format=png'],
   },
   'quote-2x1-alpha-mov': {
-    composition: 'Quote2x1Alpha-Target',
+    composition: 'Quote2x1Alpha',
     output: 'out/generated-quote-2x1-alpha.mov',
     args: ['--codec=prores', '--prores-profile=4444', '--pixel-format=yuva444p10le', '--image-format=png'],
   },
   'quote-1x1': {
-    composition: 'Quote1x1-Target',
+    composition: 'Quote1x1',
     output: 'out/generated-quote-1x1.mp4',
     args: ['--codec=h264', '--crf=16'],
   },
   'quote-1x1-alpha': {
-    composition: 'Quote1x1Alpha-Target',
+    composition: 'Quote1x1Alpha',
     output: 'out/generated-quote-1x1-alpha.webm',
     args: ['--codec=vp8', '--pixel-format=yuva420p', '--image-format=png'],
   },
   'quote-1x1-alpha-mov': {
-    composition: 'Quote1x1Alpha-Target',
+    composition: 'Quote1x1Alpha',
     output: 'out/generated-quote-1x1-alpha.mov',
     args: ['--codec=prores', '--prores-profile=4444', '--pixel-format=yuva444p10le', '--image-format=png'],
   },

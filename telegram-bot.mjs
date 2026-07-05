@@ -1614,6 +1614,7 @@ const REMOTION_FORMAT_OPTIONS = [
   "news-1x1-alpha-mov",
   "news-2x1-alpha-mov"
 ];
+const REMOTION_SHAPE_OPTIONS = ["1x1", "2x1"];
 const REMOTION_LAYOUT_OPTIONS = ["Left", "Center", "Wide", "TL", "BL"];
 const REMOTION_FIELD_LABELS = {
   quote: "цитату / заголовок",
@@ -1851,9 +1852,31 @@ function remotionDraftSummary(draft) {
   ].join("\n");
 }
 
+function remotionFormatParts(format) {
+  const value = String(format || "quote-1x1");
+  const type = value.startsWith("news-") ? "news" : "quote";
+  const shape = value.includes("-2x1") ? "2x1" : "1x1";
+  const output = value.endsWith("-alpha-mov") ? "alpha-mov" : value.endsWith("-alpha") ? "alpha" : "mp4";
+  return { type, shape, output };
+}
+
+function remotionFormatFromParts({ type = "quote", shape = "1x1", output = "mp4" } = {}) {
+  const base = `${type}-${shape}`;
+  if (output === "alpha-mov") return `${base}-alpha-mov`;
+  if (output === "alpha") return `${base}-alpha`;
+  return base;
+}
+
+function remotionOutputLabel(output) {
+  if (output === "alpha") return "WebM α";
+  if (output === "alpha-mov") return "ProRes α";
+  return "MP4";
+}
+
 function remotionPanelMarkup(draft) {
   const format = String(draft?.format || "quote-1x1");
   const layout = String(draft?.props?.layout || "Left");
+  const parts = remotionFormatParts(format);
   const rows = [
     [
       { text: "Цитата", callback_data: "sdvg:remotion:field:quote" },
@@ -1864,8 +1887,14 @@ function remotionPanelMarkup(draft) {
       { text: "Дата", callback_data: "sdvg:remotion:field:date" }
     ],
     [
-      { text: `Формат: ${format}`, callback_data: "sdvg:remotion:cycle:format" },
+      { text: `${parts.shape === "1x1" ? "✓ " : ""}1:1`, callback_data: "sdvg:remotion:shape:1x1" },
+      { text: `${parts.shape === "2x1" ? "✓ " : ""}2:1`, callback_data: "sdvg:remotion:shape:2x1" },
       { text: `Выравн.: ${layout}`, callback_data: "sdvg:remotion:cycle:layout" }
+    ],
+    [
+      { text: `${parts.output === "mp4" ? "✓ " : ""}MP4`, callback_data: "sdvg:remotion:output:mp4" },
+      { text: `${parts.output === "alpha" ? "✓ " : ""}WebM α`, callback_data: "sdvg:remotion:output:alpha" },
+      { text: `${parts.output === "alpha-mov" ? "✓ " : ""}ProRes α`, callback_data: "sdvg:remotion:output:alpha-mov" }
     ],
     [
       { text: "Лого / источник", callback_data: "sdvg:remotion:field:logo" },
@@ -4625,9 +4654,20 @@ async function handleCallbackQuery(token, callbackQuery) {
       await saveSession(botContext.DATA_DIR, currentSession);
       return;
     }
-    if (action === "cycle:format") {
-      const index = REMOTION_FORMAT_OPTIONS.indexOf(draft.format);
-      draft.format = REMOTION_FORMAT_OPTIONS[(index + 1 + REMOTION_FORMAT_OPTIONS.length) % REMOTION_FORMAT_OPTIONS.length];
+    if (action.startsWith("shape:")) {
+      const shape = REMOTION_SHAPE_OPTIONS.includes(action.slice("shape:".length)) ? action.slice("shape:".length) : "1x1";
+      const parts = remotionFormatParts(draft.format);
+      draft.format = remotionFormatFromParts({ ...parts, shape });
+      draft.props.type = draft.format.startsWith("news-") ? "news" : "quote";
+      currentSession.remotionCtx = { ...ctx, draft, panelMessageId: callbackMessageId };
+      await showRemotionPanel(token, chatId, callbackMessageId);
+      return;
+    }
+    if (action.startsWith("output:")) {
+      const output = action.slice("output:".length);
+      const safeOutput = ["mp4", "alpha", "alpha-mov"].includes(output) ? output : "mp4";
+      const parts = remotionFormatParts(draft.format);
+      draft.format = remotionFormatFromParts({ ...parts, output: safeOutput });
       draft.props.type = draft.format.startsWith("news-") ? "news" : "quote";
       currentSession.remotionCtx = { ...ctx, draft, panelMessageId: callbackMessageId };
       await showRemotionPanel(token, chatId, callbackMessageId);
