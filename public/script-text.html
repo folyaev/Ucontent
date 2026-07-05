@@ -64,6 +64,19 @@
             Сделать скриншот страницы, если обычная загрузка не сработает
           </label>
         </form>
+        <form id="remotion-render-form" class="remotion-render-form">
+          <select id="remotion-format" title="Remotion format">
+            <option value="quote-1x1">Quote 1:1</option>
+            <option value="quote-2x1">Quote 2:1</option>
+            <option value="news-1x1">News 1:1</option>
+            <option value="news-2x1">News 2:1</option>
+            <option value="quote-1x1-alpha">Quote 1:1 Alpha</option>
+            <option value="quote-2x1-alpha">Quote 2:1 Alpha</option>
+          </select>
+          <input id="remotion-source" type="text" placeholder="Source" autocomplete="off" />
+          <input id="remotion-author" type="text" placeholder="Author" autocomplete="off" />
+          <button id="remotion-render-button" type="submit">Render</button>
+        </form>
         <div id="media-download-status" class="media-download-status"></div>
         <div id="media-picker-list" class="media-picker-list"></div>
       </div>

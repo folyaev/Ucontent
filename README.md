@@ -91,3 +91,30 @@ UContent prefers local tools:
 - Remotion: `UContent/Remotion`
 
 External paths can still be set through `.env`, but they are no longer required for the default layout.
+
+## Remotion Graphics
+
+The media picker can render Remotion quote/news cards directly into `media/graphics` and attach the result to the active segment.
+
+In Docker, Remotion dependencies are installed during the `ucontent` image build from `Remotion/package-lock.json`.
+
+Programmatic render endpoint:
+
+```http
+POST /api/remotion/render
+```
+
+Example body:
+
+```json
+{
+  "format": "quote-1x1",
+  "props": {
+    "source": "UCONTENT",
+    "quote": "Text to render",
+    "author": "Author"
+  }
+}
+```
+
+Supported formats: `quote-1x1`, `quote-2x1`, `news-1x1`, `news-2x1`, plus `quote-1x1-alpha` and `quote-2x1-alpha`.

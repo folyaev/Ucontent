@@ -759,6 +759,19 @@ button:disabled {
   border-bottom: 1px solid var(--line);
 }
 
+.remotion-render-form {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.8fr) minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.remotion-render-form select,
+.remotion-render-form input {
+  min-width: 0;
+}
+
 .media-download-fallback {
   grid-column: 1 / -1;
   display: flex;
@@ -778,6 +791,16 @@ button:disabled {
   border-bottom: 1px solid var(--line);
   color: var(--muted);
   font-size: 13px;
+}
+
+@media (max-width: 760px) {
+  .remotion-render-form {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .remotion-render-form button {
+    grid-column: 1 / -1;
+  }
 }
 
 .media-picker-list {

@@ -19,6 +19,11 @@ const mediaDownloadUrlInput = document.querySelector("#media-download-url");
 const mediaDownloadButton = document.querySelector("#media-download-button");
 const mediaDownloadStatusEl = document.querySelector("#media-download-status");
 const mediaDownloadFallbackScreenshotInput = document.querySelector("#media-download-fallback-screenshot");
+const remotionRenderForm = document.querySelector("#remotion-render-form");
+const remotionFormatInput = document.querySelector("#remotion-format");
+const remotionSourceInput = document.querySelector("#remotion-source");
+const remotionAuthorInput = document.querySelector("#remotion-author");
+const remotionRenderButton = document.querySelector("#remotion-render-button");
 const themeToggleButton = document.querySelector("#theme-toggle");
 const searchDialogEl = document.querySelector("#search-dialog");
 const searchDialogQueryEl = document.querySelector("#search-dialog-query");
@@ -760,7 +765,10 @@ function mediaForFile(file) {
   return {
     url: "",
     path: file.path || "",
-    thumbnail: file.thumbnail || ""
+    thumbnail: file.thumbnail || "",
+    title: file.title || file.name || "",
+    description: file.description || "",
+    format_note: file.format_note || ""
   };
 }
 
@@ -875,6 +883,8 @@ async function openMediaPicker(segmentId) {
   if (!segment) return;
   activeMediaSegmentId = segmentId;
   activeMediaTopic = segment.topic || "";
+  remotionSourceInput.value = segment.topic || "";
+  remotionAuthorInput.value = "";
   mediaPickerEl.hidden = false;
   await loadMediaLibrary(activeMediaTopic).catch((error) => {
     mediaPickerListEl.innerHTML = `<p class="empty">${escapeHtml(error.message || "Media list failed")}</p>`;
@@ -887,6 +897,8 @@ function closeMediaPicker() {
   activeMediaTopic = "";
   mediaUploadInput.value = "";
   mediaDownloadUrlInput.value = "";
+  remotionSourceInput.value = "";
+  remotionAuthorInput.value = "";
   mediaDownloadStatusEl.textContent = "";
   if (activeDownloadPoll) {
     clearTimeout(activeDownloadPoll);
@@ -957,6 +969,49 @@ async function downloadMediaUrl(url) {
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || "Download failed");
   await pollMediaDownload(data.job.id);
+}
+
+function remotionQuoteFromSegment(segment) {
+  return String(segment?.text || "")
+    .replace(/^https?:\/\/\S+$/i, "")
+    .replace(/^\/+/, "")
+    .trim() || String(segment?.topic || "").trim();
+}
+
+async function renderRemotionForActiveSegment() {
+  const segment = segmentById(activeMediaSegmentId);
+  if (!segment) return;
+  const quote = remotionQuoteFromSegment(segment);
+  if (!quote) throw new Error("Segment text is empty");
+  remotionRenderButton.disabled = true;
+  setMediaDownloadStatus("Rendering Remotion card...");
+  const format = remotionFormatInput.value || "quote-1x1";
+  const isNews = format.startsWith("news-");
+  const response = await fetch("/api/remotion/render", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      format,
+      props: {
+        type: isNews ? "news" : "quote",
+        source: remotionSourceInput.value || segment.topic || "UContent",
+        quote,
+        title: quote,
+        author: remotionAuthorInput.value || "",
+        label: isNews ? "News" : "Quote",
+        accent: "#f0b24c",
+        background: { dim: 0.7 }
+      }
+    })
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "Remotion render failed");
+  if (data.file) {
+    await addMediaToSegment(activeMediaSegmentId, mediaForFile(data.file));
+    setMediaDownloadStatus(`Rendered: ${data.file.name || data.file.path}`);
+    await loadMediaLibrary(activeMediaTopic).catch(() => null);
+    closeMediaPicker();
+  }
 }
 
 async function loadPreviews() {
@@ -1181,6 +1236,17 @@ mediaDownloadForm.addEventListener("submit", async (event) => {
     setStatus(error.message || "Download failed");
   } finally {
     mediaDownloadButton.disabled = false;
+  }
+});
+
+remotionRenderForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    await renderRemotionForActiveSegment();
+  } catch (error) {
+    setMediaDownloadStatus(error.message || "Remotion render failed");
+  } finally {
+    remotionRenderButton.disabled = false;
   }
 });
 

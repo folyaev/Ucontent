@@ -19,6 +19,9 @@ RUN apt-get update \
 COPY package*.json ./
 RUN npm ci
 
+COPY Remotion/package*.json ./Remotion/
+RUN cd Remotion && npm ci
+
 COPY tools/video-scene-cutter/requirements.txt ./tools/video-scene-cutter/requirements.txt
 COPY tools/utrends/requirements.txt ./tools/utrends/requirements.txt
 RUN python3 -m venv .venv \
