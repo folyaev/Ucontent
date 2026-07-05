@@ -31,6 +31,7 @@ export type QuoteVideoProps = {
   label?: string;
   accent?: string;
   textScale?: number; // Multiplier for title / quote typography
+  highlightDelaySeconds?: number; // Delay before bracket highlights start animating
   logoIcon?: string; // Logo icon URL or path or special keyword
   showDecorativeQuote?: boolean; // Whether to render the background decorative quote mark
   

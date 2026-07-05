@@ -15,6 +15,33 @@ import type {QuoteVideoProps} from '../types';
 const clean = (value: string | undefined) => String(value ?? '').trim();
 const isVideoAsset = (value: string | undefined) =>
   /\.(mp4|mov|m4v|webm|mkv)(?:$|[?#])/i.test(clean(value));
+const HIGHLIGHT_COLORS = ['#E7FF02', '#82FE83', '#89F0FE', '#FF629C'];
+
+type TextToken = {
+  word: string;
+  highlightIndex: number | null;
+};
+
+const parseHighlightedWords = (text: string): TextToken[] => {
+  const tokens: TextToken[] = [];
+  let highlightIndex = -1;
+  const pattern = /\[([^\]]+)\]/g;
+  let cursor = 0;
+
+  const pushWords = (value: string, activeHighlight: number | null) => {
+    const words = value.trim().split(/\s+/).filter(Boolean);
+    for (const word of words) tokens.push({word, highlightIndex: activeHighlight});
+  };
+
+  for (const match of text.matchAll(pattern)) {
+    pushWords(text.slice(cursor, match.index), null);
+    highlightIndex += 1;
+    pushWords(match[1] ?? '', highlightIndex);
+    cursor = (match.index ?? 0) + match[0].length;
+  }
+  pushWords(text.slice(cursor), null);
+  return tokens;
+};
 
 // Dynamic font scaling metrics to keep both short and long text visually balanced
 const getNews2x1Metrics = (text: string, scale: number) => {
@@ -156,15 +183,18 @@ const AnimatedText = ({
   text,
   style,
   s,
+  highlightDelaySeconds = 1.35,
 }: {
   text: string;
   style: React.CSSProperties;
   s: number;
+  highlightDelaySeconds?: number;
 }) => {
   const frame = useCurrentFrame();
   const {fps, durationInFrames} = useVideoConfig();
   
-  const words = text.split(' ');
+  const words = parseHighlightedWords(text);
+  const highlightStart = Math.round(highlightDelaySeconds * fps);
 
   // Exit interpolation
   const exitStart = durationInFrames - Math.round(0.75 * fps);
@@ -183,7 +213,7 @@ const AnimatedText = ({
         justifyContent: style.textAlign === 'center' ? 'center' : 'flex-start',
       }}
     >
-      {words.map((word, idx) => {
+      {words.map((token, idx) => {
         // Entry spring staggered by 1.5 frames per word
         const progress = spring({
           frame: Math.max(0, frame - idx * 1.5),
@@ -193,6 +223,18 @@ const AnimatedText = ({
         
         const y = interpolate(progress, [0, 1], [35 * s, 0]);
         const opacity = interpolate(progress, [0, 1], [0, 1]);
+        const isHighlighted = token.highlightIndex !== null;
+        const highlightProgress = isHighlighted
+          ? interpolate(
+              frame,
+              [highlightStart + (token.highlightIndex ?? 0) * 12, highlightStart + (token.highlightIndex ?? 0) * 12 + 22],
+              [0, 1],
+              {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'}
+            )
+          : 0;
+        const highlightColor = isHighlighted
+          ? HIGHLIGHT_COLORS[(token.highlightIndex ?? 0) % HIGHLIGHT_COLORS.length]
+          : 'transparent';
 
         return (
           <span
@@ -211,11 +253,56 @@ const AnimatedText = ({
             <span
               style={{
                 display: 'inline-block',
+                position: 'relative',
+                padding: isHighlighted ? `0 ${9 * s}px` : undefined,
+                marginLeft: isHighlighted ? `${-5 * s}px` : undefined,
+                marginRight: isHighlighted ? `${-4 * s}px` : undefined,
                 transform: `translateY(${y}px)`,
                 opacity: opacity * exit,
               }}
             >
-              {word}
+              {isHighlighted && (
+                <span
+                  style={{
+                    position: 'absolute',
+                    zIndex: 0,
+                    left: 0,
+                    right: 0,
+                    bottom: `${10 * s}px`,
+                    height: '0.78em',
+                    borderRadius: `${6 * s}px`,
+                    backgroundColor: highlightColor,
+                    transform: `scaleX(${highlightProgress}) rotate(${token.highlightIndex ? -0.7 : 0.6}deg)`,
+                    transformOrigin: 'left center',
+                    opacity: interpolate(highlightProgress, [0, 0.15, 1], [0, 1, 1], {
+                      extrapolateLeft: 'clamp',
+                      extrapolateRight: 'clamp',
+                    }),
+                  }}
+                />
+              )}
+              <span
+                style={{
+                  position: 'relative',
+                  zIndex: 1,
+                  opacity: isHighlighted ? 1 - highlightProgress : 1,
+                }}
+              >
+                {token.word}
+              </span>
+              {isHighlighted && (
+                <span
+                  style={{
+                    position: 'absolute',
+                    zIndex: 2,
+                    inset: 0,
+                    color: '#050505',
+                    opacity: highlightProgress,
+                  }}
+                >
+                  {token.word}
+                </span>
+              )}
             </span>
             <span style={{display: 'inline-block'}}>&nbsp;</span>
           </span>
@@ -447,6 +534,7 @@ export const QuoteVideo = ({
   meta,
   accent,
   textScale = 1,
+  highlightDelaySeconds = 1.35,
   background,
   avatar,
   logoIcon,
@@ -597,6 +685,7 @@ export const QuoteVideo = ({
                 textShadow: shadow,
               }}
               s={s}
+              highlightDelaySeconds={highlightDelaySeconds}
             />
             {dateText && (
               <div
@@ -717,6 +806,7 @@ export const QuoteVideo = ({
                 textShadow: shadow,
               }}
               s={s}
+              highlightDelaySeconds={highlightDelaySeconds}
             />
           </div>
 
@@ -806,6 +896,7 @@ export const QuoteVideo = ({
               textShadow: shadow,
             }}
             s={s}
+            highlightDelaySeconds={highlightDelaySeconds}
           />
         </div>
 
@@ -916,6 +1007,7 @@ export const QuoteVideo = ({
             textShadow: shadow,
           }}
           s={s}
+          highlightDelaySeconds={highlightDelaySeconds}
         />
       </div>
 

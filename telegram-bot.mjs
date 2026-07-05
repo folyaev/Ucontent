@@ -1617,7 +1617,7 @@ const REMOTION_FORMAT_OPTIONS = [
 const REMOTION_SHAPE_OPTIONS = ["1x1", "2x1"];
 const REMOTION_LAYOUT_OPTIONS = ["Left", "Center", "Wide", "TL", "BL"];
 const REMOTION_FIELD_LABELS = {
-  quote: "цитату / заголовок",
+  quote: "цитату / заголовок. Выделение: [важные слова]",
   author: "имя автора",
   role: "должность автора",
   date: "дату",
@@ -1653,6 +1653,7 @@ function remotionHelpText() {
   return [
     "<b>Remotion</b>",
     "Открою панель настройки карточки. Поля редактируются кнопками, результат можно перерендерить кнопками A-/A+.",
+    "В цитате выделяйте фрагменты квадратными скобками: <code>Обычный текст [важные слова]</code>.",
     "",
     "Логотипы храните в <code>media/logos</code>: PNG/WebP/SVG с прозрачностью; 1024x1024+ для знака или 2400px+ по ширине для горизонтального лого.",
     "",

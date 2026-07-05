@@ -3047,6 +3047,8 @@ function buildRemotionProps(body = {}) {
   const label = cleanRemotionText(props.label || body.label, 80);
   const textScaleRaw = Number(props.textScale || props.text_scale || body.textScale || body.text_scale || 1);
   const textScale = Number.isFinite(textScaleRaw) ? Math.max(0.72, Math.min(1.38, textScaleRaw)) : 1;
+  const highlightDelayRaw = Number(props.highlightDelaySeconds || props.highlight_delay_seconds || body.highlightDelaySeconds || body.highlight_delay_seconds || 1.35);
+  const highlightDelaySeconds = Number.isFinite(highlightDelayRaw) ? Math.max(0, Math.min(12, highlightDelayRaw)) : 1.35;
   const accent = /^#[0-9a-f]{6}$/i.test(String(props.accent || body.accent || "")) ? String(props.accent || body.accent) : "#f0b24c";
   const type = ["news", "quote"].includes(String(props.type || body.type || "")) ? String(props.type || body.type) : undefined;
   const layout = cleanRemotionText(props.layout || body.layout, 24);
@@ -3075,6 +3077,7 @@ function buildRemotionProps(body = {}) {
     label,
     accent,
     textScale,
+    highlightDelaySeconds,
     transparent,
     ...(avatar ? { avatar } : {}),
     ...(logoIcon ? { logoIcon } : {}),
