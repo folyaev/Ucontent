@@ -7,6 +7,7 @@ import {
   staticFile,
   useCurrentFrame,
   useVideoConfig,
+  Easing,
 } from 'remotion';
 import type {CSSProperties} from 'react';
 import {colors, fontStack} from '../design/tokens';
@@ -18,8 +19,9 @@ const isVideoAsset = (value: string | undefined) =>
 const HIGHLIGHT_COLORS = ['#E7FF02', '#82FE83', '#89F0FE', '#FF629C'];
 
 type TextToken = {
-  word: string;
+  text: string;
   highlightIndex: number | null;
+  lineBreak?: boolean;
 };
 
 const parseHighlightedWords = (text: string): TextToken[] => {
@@ -28,18 +30,57 @@ const parseHighlightedWords = (text: string): TextToken[] => {
   const pattern = /\[([^\]]+)\]/g;
   let cursor = 0;
 
-  const pushWords = (value: string, activeHighlight: number | null) => {
-    const words = value.trim().split(/\s+/).filter(Boolean);
-    for (const word of words) tokens.push({word, highlightIndex: activeHighlight});
+  const pushLineBreak = () => {
+    if (tokens.length === 0 || tokens[tokens.length - 1]?.lineBreak) return;
+    tokens.push({text: '', highlightIndex: null, lineBreak: true});
+  };
+
+  const pushTextSegment = (value: string, segmentHighlightIndex: number | null) => {
+    const parts = String(value || '').split('^');
+    parts.forEach((part, partIndex) => {
+      if (partIndex > 0) pushLineBreak();
+      const normalized = part.trim().replace(/\s+/g, ' ');
+      if (!normalized) return;
+      if (segmentHighlightIndex === null) {
+        for (const word of normalized.split(' ').filter(Boolean)) {
+          tokens.push({
+            text: word,
+            highlightIndex: null,
+          });
+        }
+      } else {
+        for (const word of normalized.split(' ').filter(Boolean)) {
+          tokens.push({
+            text: word,
+            highlightIndex: segmentHighlightIndex,
+          });
+        }
+      }
+    });
+  };
+
+  const pushWords = (value: string) => {
+    pushTextSegment(value, null);
+  };
+
+  const pushHighlighted = (value: string, segmentHighlightIndex: number) => {
+    if (String(value || '').trim()) {
+      pushTextSegment(value, segmentHighlightIndex);
+    }
   };
 
   for (const match of text.matchAll(pattern)) {
-    pushWords(text.slice(cursor, match.index), null);
-    highlightIndex += 1;
-    pushWords(match[1] ?? '', highlightIndex);
+    pushWords(text.slice(cursor, match.index));
+    const highlightedParts = String(match[1] ?? '').split('^');
+    highlightedParts.forEach((part, partIndex) => {
+      if (partIndex > 0) pushLineBreak();
+      if (!part.trim()) return;
+      highlightIndex += 1;
+      pushHighlighted(part, highlightIndex);
+    });
     cursor = (match.index ?? 0) + match[0].length;
   }
-  pushWords(text.slice(cursor), null);
+  pushWords(text.slice(cursor));
   return tokens;
 };
 
@@ -184,17 +225,26 @@ const AnimatedText = ({
   style,
   s,
   highlightDelaySeconds = 1.35,
+  highlightDurationSeconds = 1.05,
+  highlightStaggerSeconds = 1.2,
 }: {
   text: string;
   style: React.CSSProperties;
   s: number;
   highlightDelaySeconds?: number;
+  highlightDurationSeconds?: number;
+  highlightStaggerSeconds?: number;
 }) => {
   const frame = useCurrentFrame();
   const {fps, durationInFrames} = useVideoConfig();
   
   const words = parseHighlightedWords(text);
-  const highlightStart = Math.round(highlightDelaySeconds * fps);
+  const lastTextTokenIndex = words.reduce((maxIndex, token, index) => (token.lineBreak ? maxIndex : index), 0);
+  const textEntryComplete = Math.ceil(lastTextTokenIndex * 3.5 + 34 + 0.12 * fps);
+  const highlightStart = Math.max(Math.round(highlightDelaySeconds * fps), textEntryComplete);
+  const highlightDuration = Math.round(highlightDurationSeconds * fps);
+  const highlightPause = Math.round(0.15 * fps);
+  const highlightStagger = Math.max(Math.round(highlightStaggerSeconds * fps), highlightDuration + highlightPause);
 
   // Exit interpolation
   const exitStart = durationInFrames - Math.round(0.75 * fps);
@@ -208,103 +258,188 @@ const AnimatedText = ({
     <div
       style={{
         ...style,
-        display: 'flex',
-        flexWrap: 'wrap',
-        justifyContent: style.textAlign === 'center' ? 'center' : 'flex-start',
+        display: 'block',
+        textAlign: style.textAlign,
+        opacity: exit,
       }}
     >
       {words.map((token, idx) => {
-        // Entry spring staggered by 1.5 frames per word
+        if (token.lineBreak) {
+          return <br key={idx} />;
+        }
+
+        // Entry spring staggered per word for a softer text reveal.
         const progress = spring({
-          frame: Math.max(0, frame - idx * 1.5),
+          frame: Math.max(0, frame - idx * 3.5),
           fps,
-          config: {damping: 18, stiffness: 120, mass: 0.8},
+          config: {damping: 28, stiffness: 54, mass: 1.25},
         });
         
-        const y = interpolate(progress, [0, 1], [35 * s, 0]);
+        const y = interpolate(progress, [0, 1], [58 * s, 0]);
         const opacity = interpolate(progress, [0, 1], [0, 1]);
         const isHighlighted = token.highlightIndex !== null;
         const highlightProgress = isHighlighted
           ? interpolate(
               frame,
-              [highlightStart + (token.highlightIndex ?? 0) * 12, highlightStart + (token.highlightIndex ?? 0) * 12 + 22],
+              [
+                highlightStart + (token.highlightIndex ?? 0) * highlightStagger,
+                highlightStart + (token.highlightIndex ?? 0) * highlightStagger + highlightDuration,
+              ],
               [0, 1],
-              {extrapolateLeft: 'clamp', extrapolateRight: 'clamp'}
+              {
+                extrapolateLeft: 'clamp',
+                extrapolateRight: 'clamp',
+                easing: Easing.bezier(0.25, 0.1, 0.25, 1)
+              }
+            )
+          : 0;
+        const highlightTokenIndex = isHighlighted
+          ? words.slice(0, idx).filter((item) => item.highlightIndex === token.highlightIndex).length
+          : 0;
+        const highlightTokenCount = isHighlighted
+          ? Math.max(1, words.filter((item) => item.highlightIndex === token.highlightIndex).length)
+          : 1;
+        const tokenHighlightProgress = isHighlighted
+          ? interpolate(
+              highlightProgress,
+              [highlightTokenIndex / highlightTokenCount, (highlightTokenIndex + 1) / highlightTokenCount],
+              [0, 1],
+              {
+                extrapolateLeft: 'clamp',
+                extrapolateRight: 'clamp',
+                easing: Easing.bezier(0.25, 0.1, 0.25, 1),
+              }
             )
           : 0;
         const highlightColor = isHighlighted
           ? HIGHLIGHT_COLORS[(token.highlightIndex ?? 0) % HIGHLIGHT_COLORS.length]
           : 'transparent';
 
+        const isPunct = /^[,.!?;:?]+$/.test(token.text);
+        const nextToken = idx + 1 < words.length ? words[idx + 1] : null;
+        const prevToken = idx > 0 ? words[idx - 1] : null;
+        const nextIsPunct = nextToken !== null && /^[,.!?;:?]+$/.test(nextToken.text);
+        const nextIsBreak = nextToken?.lineBreak === true;
+        const nextIsSameHighlight = isHighlighted && nextToken?.highlightIndex === token.highlightIndex;
+        const prevIsSameHighlight = isHighlighted && prevToken?.highlightIndex === token.highlightIndex;
+        const renderText = `${token.text}${nextIsSameHighlight ? '\u00A0' : ''}`;
+        const hPadL = isPunct ? 0 : 4;
+        const hPadR = isPunct ? 0 : 4;
+        const highlightWidth = `${Math.max(0, Math.min(100, tokenHighlightProgress * 100))}%`;
+        const highlightPadLeft = prevIsSameHighlight ? 0 : 8 * s;
+        const highlightPadRight = nextIsSameHighlight ? 0 : 8 * s;
+        const highlightPadTop = 3 * s;
+        const highlightPadBottom = 16 * s;
+        const highlightTextPadding = `${highlightPadTop}px ${highlightPadRight}px ${highlightPadBottom}px ${highlightPadLeft}px`;
+        const highlightRadius = `${prevIsSameHighlight ? 0 : 8 * s}px ${nextIsSameHighlight ? 0 : 8 * s}px ${nextIsSameHighlight ? 0 : 8 * s}px ${prevIsSameHighlight ? 0 : 8 * s}px`;
+
+        if (isHighlighted) {
+          return (
+            <span
+              key={idx}
+              style={{
+                display: 'inline-block',
+                position: 'relative',
+                zIndex: 1,
+                overflow: 'visible',
+                verticalAlign: 'bottom',
+                lineHeight: style.lineHeight,
+                paddingTop: `${30 * s}px`,
+                marginTop: `${-30 * s}px`,
+                paddingBottom: `${30 * s}px`,
+                marginBottom: `${-30 * s}px`,
+                transform: `translateY(${y}px)`,
+                  opacity,
+              }}
+            >
+              <span
+                style={{
+                  display: 'inline-block',
+                  position: 'relative',
+                  color: colors.white,
+                  padding: `0 ${highlightPadRight}px 0 ${highlightPadLeft}px`,
+                  marginLeft: `${-4 * s}px`,
+                  marginRight: `${-4 * s}px`,
+                }}
+              >
+                <span
+                  style={{
+                    position: 'relative',
+                    zIndex: 1,
+                  }}
+                >
+                  {renderText}
+                </span>
+                <span
+                  style={{
+                    position: 'absolute',
+                    zIndex: 2,
+                    left: 0,
+                    top: `${-highlightPadTop}px`,
+                    bottom: `${-highlightPadBottom}px`,
+                    width: highlightWidth,
+                    overflow: 'hidden',
+                    borderRadius: highlightRadius,
+                    backgroundColor: highlightColor,
+                    pointerEvents: 'none',
+                  }}
+                >
+                  <span
+                    style={{
+                      display: 'inline-block',
+                      padding: highlightTextPadding,
+                      color: '#050505',
+                      whiteSpace: 'pre',
+                    }}
+                  >
+                    {renderText}
+                  </span>
+                </span>
+              </span>
+              {!nextIsPunct && !nextIsBreak && !nextIsSameHighlight && <span style={{display: 'inline-block'}}>&nbsp;</span>}
+            </span>
+          );
+        }
+
         return (
           <span
             key={idx}
             style={{
               display: 'inline-block',
-              overflow: 'hidden',
+              position: 'relative',
+              zIndex: 2,
+              overflow: 'visible',
               verticalAlign: 'bottom',
               lineHeight: style.lineHeight,
-              paddingTop: `${20 * s}px`,
-              marginTop: `${-20 * s}px`,
-              paddingBottom: `${25 * s}px`,
-              marginBottom: `${-25 * s}px`,
+              paddingTop: `${30 * s}px`,
+              marginTop: `${-30 * s}px`,
+              paddingBottom: `${30 * s}px`,
+              marginBottom: `${-30 * s}px`,
+              paddingLeft: `${hPadL * s}px`,
+              marginLeft: `${-hPadL * s}px`,
+              paddingRight: `${hPadR * s}px`,
+              marginRight: `${-hPadR * s}px`,
             }}
           >
             <span
               style={{
                 display: 'inline-block',
                 position: 'relative',
-                padding: isHighlighted ? `0 ${9 * s}px` : undefined,
-                marginLeft: isHighlighted ? `${-5 * s}px` : undefined,
-                marginRight: isHighlighted ? `${-4 * s}px` : undefined,
+                color: colors.white,
                 transform: `translateY(${y}px)`,
-                opacity: opacity * exit,
+                opacity,
               }}
             >
-              {isHighlighted && (
-                <span
-                  style={{
-                    position: 'absolute',
-                    zIndex: 0,
-                    left: 0,
-                    right: 0,
-                    bottom: `${10 * s}px`,
-                    height: '0.78em',
-                    borderRadius: `${6 * s}px`,
-                    backgroundColor: highlightColor,
-                    transform: `scaleX(${highlightProgress}) rotate(${token.highlightIndex ? -0.7 : 0.6}deg)`,
-                    transformOrigin: 'left center',
-                    opacity: interpolate(highlightProgress, [0, 0.15, 1], [0, 1, 1], {
-                      extrapolateLeft: 'clamp',
-                      extrapolateRight: 'clamp',
-                    }),
-                  }}
-                />
-              )}
               <span
                 style={{
                   position: 'relative',
                   zIndex: 1,
-                  opacity: isHighlighted ? 1 - highlightProgress : 1,
                 }}
               >
-                {token.word}
+                {renderText}
               </span>
-              {isHighlighted && (
-                <span
-                  style={{
-                    position: 'absolute',
-                    zIndex: 2,
-                    inset: 0,
-                    color: '#050505',
-                    opacity: highlightProgress,
-                  }}
-                >
-                  {token.word}
-                </span>
-              )}
             </span>
-            <span style={{display: 'inline-block'}}>&nbsp;</span>
+            {!nextIsPunct && !nextIsBreak && <span style={{display: 'inline-block'}}>&nbsp;</span>}
           </span>
         );
       })}
@@ -355,13 +490,17 @@ const Logo = ({
   textAlign?: 'left' | 'center' | 'right';
 }) => {
   const hasIcon = Boolean(icon);
+  const normalizedText = clean(text);
+  const isDefaultSourceText = /^(?:ucontent|ut)$/i.test(normalizedText);
+  const isTechnicalLogoText = /(?:^|[_\-\s])logo(?:$|[_\-\s])|_cc$|\.(?:png|jpe?g|webp|svg)$/i.test(normalizedText);
+  const shouldShowText = !hasIcon || (!isDefaultSourceText && !isTechnicalLogoText);
   
   const iconNode = hasIcon && icon ? (
     icon === 'orange-circle' ? (
       <div
         style={{
-          width: `${fontSize * 0.5 * s}px`,
-          height: `${fontSize * 0.5 * s}px`,
+          width: `${fontSize * 0.78 * s}px`,
+          height: `${fontSize * 0.78 * s}px`,
           borderRadius: '50%',
           background: 'linear-gradient(135deg, #ff7a00 0%, #ff4d00 100%)',
           marginRight: `${fontSize * 0.15 * s}px`,
@@ -372,11 +511,11 @@ const Logo = ({
       <Img
         src={icon}
         style={{
-          width: `${fontSize * 0.5 * s}px`,
-          height: `${fontSize * 0.5 * s}px`,
-          borderRadius: '50%',
-          marginRight: `${fontSize * 0.15 * s}px`,
-          objectFit: 'cover',
+          width: `${fontSize * 4.1 * s}px`,
+          height: `${fontSize * 1.5 * s}px`,
+          marginRight: shouldShowText ? `${fontSize * 0.2 * s}px` : 0,
+          objectFit: 'contain',
+          objectPosition: 'left center',
           flexShrink: 0,
         }}
       />
@@ -396,17 +535,19 @@ const Logo = ({
         }}
       >
         {iconNode}
-        <span
-          style={{
-            fontSize: fontSize * s,
-            lineHeight: `${lineHeight * s}px`,
-            fontWeight: 500,
-            color: colors.white,
-            letterSpacing: '-0.01em',
-          }}
-        >
-          {text}
-        </span>
+        {shouldShowText && (
+          <span
+            style={{
+              fontSize: fontSize * s,
+              lineHeight: `${lineHeight * s}px`,
+              fontWeight: 500,
+              color: colors.white,
+              letterSpacing: '-0.01em',
+            }}
+          >
+            {text}
+          </span>
+        )}
       </div>
     );
   }
@@ -422,17 +563,19 @@ const Logo = ({
       }}
     >
       {iconNode}
-      <span
-        style={{
-          fontSize: fontSize * s,
-          lineHeight: `${lineHeight * s}px`,
-          fontWeight: 500,
-          color: colors.white,
-          letterSpacing: '-0.01em',
-        }}
-      >
-        {text}
-      </span>
+      {shouldShowText && (
+        <span
+          style={{
+            fontSize: fontSize * s,
+            lineHeight: `${lineHeight * s}px`,
+            fontWeight: 500,
+            color: colors.white,
+            letterSpacing: '-0.01em',
+          }}
+        >
+          {text}
+        </span>
+      )}
     </div>
   );
 };
@@ -534,14 +677,17 @@ export const QuoteVideo = ({
   meta,
   accent,
   textScale = 1,
+  lineHeightScale = 1,
   highlightDelaySeconds = 1.35,
+  highlightDurationSeconds = 1.05,
+  highlightStaggerSeconds = 1.2,
   background,
   avatar,
   logoIcon,
   showDecorativeQuote = false,
 }: QuoteVideoProps) => {
   const {width, height} = useVideoConfig();
-  const {enter, delayed, exit} = useAnimation();
+  const {delayed, exit} = useAnimation();
   const frame = useCurrentFrame();
   const fade = interpolate(frame, [8, 22], [0, 1], {
     extrapolateLeft: 'clamp',
@@ -551,6 +697,11 @@ export const QuoteVideo = ({
   // 1920px is the Figma base height for both 1:1 and 2:1 templates
   const s = height / 1920;
   const mainTextScale = Math.max(0.72, Math.min(1.38, Number(textScale) || 1));
+  const mainLineScale = Math.max(0.72, Math.min(1.5, Number(lineHeightScale) || 1));
+  const softElementEnter: CSSProperties = {
+    opacity: delayed * exit,
+    transform: `translateY(${interpolate(delayed, [0, 1], [34 * s, 0])}px)`,
+  };
   
   // Resolve content aliases
   const logoText = clean(logo || source) || 'UT';
@@ -596,44 +747,6 @@ export const QuoteVideo = ({
     const isBadge = resolvedLayout === 'Badge';
     const isBL = resolvedLayout === 'BL';
 
-    const logoNode = isBadge ? (
-      <div
-        style={{
-          display: 'inline-flex',
-          alignItems: 'center',
-          padding: `${12 * s}px ${20 * s}px`,
-          borderRadius: 100 * s,
-          backgroundColor: 'rgba(0, 0, 0, 0.72)',
-          textShadow: shadow,
-        }}
-      >
-        <span
-          style={{
-            fontSize: 96 * s,
-            lineHeight: `${92 * s}px`,
-            fontWeight: 500,
-            color: colors.white,
-            letterSpacing: '-0.01em',
-          }}
-        >
-          {logoText}
-        </span>
-      </div>
-    ) : (
-      <span
-        style={{
-          fontSize: 96 * s,
-          lineHeight: `${92 * s}px`,
-          fontWeight: 500,
-          color: colors.white,
-          letterSpacing: '-0.01em',
-          textShadow: shadow,
-        }}
-      >
-        {logoText}
-      </span>
-    );
-
     const {size: titleFontSize, line: titleLineHeight} = getNews1x1Metrics(contentText, s * mainTextScale);
 
     return (
@@ -659,10 +772,18 @@ export const QuoteVideo = ({
           <div
             style={{
               marginBottom: isBL ? 40 * s : 0,
-              opacity: fade,
+              ...softElementEnter,
             }}
           >
-            {logoNode}
+            <Logo
+              text={logoText}
+              icon={logoIcon}
+              isBadge={isBadge}
+              s={s}
+              shadow={shadow}
+              fontSize={96}
+              lineHeight={92}
+            />
           </div>
 
           {/* Copy (Title + Date) */}
@@ -678,7 +799,7 @@ export const QuoteVideo = ({
               text={contentText}
               style={{
                 fontSize: titleFontSize,
-                lineHeight: `${titleLineHeight}px`,
+                lineHeight: `${titleLineHeight * mainLineScale}px`,
                 fontWeight: 500,
                 color: colors.white,
                 letterSpacing: '-0.01em',
@@ -686,6 +807,8 @@ export const QuoteVideo = ({
               }}
               s={s}
               highlightDelaySeconds={highlightDelaySeconds}
+              highlightDurationSeconds={highlightDurationSeconds}
+              highlightStaggerSeconds={highlightStaggerSeconds}
             />
             {dateText && (
               <div
@@ -696,8 +819,7 @@ export const QuoteVideo = ({
                   color: '#686868',
                   letterSpacing: '-0.01em',
                   textShadow: shadow,
-                  opacity: delayed * exit,
-                  transform: `translateY(${interpolate(delayed, [0, 1], [15 * s, 0])}px) scale(${interpolate(delayed, [0, 1], [0.95, 1.0])})`,
+                  ...softElementEnter,
                 }}
               >
                 {dateText}
@@ -770,7 +892,7 @@ export const QuoteVideo = ({
           <div
             style={{
               alignSelf: isCenter ? 'center' : 'flex-start',
-              opacity: fade,
+              ...softElementEnter,
             }}
           >
             <Logo
@@ -797,7 +919,7 @@ export const QuoteVideo = ({
               text={contentText}
               style={{
                 fontSize: quoteFontSize,
-                lineHeight: `${quoteLineHeight}px`,
+                lineHeight: `${quoteLineHeight * mainLineScale}px`,
                 fontWeight: 500,
                 color: colors.white,
                 letterSpacing: '-0.01em',
@@ -807,6 +929,8 @@ export const QuoteVideo = ({
               }}
               s={s}
               highlightDelaySeconds={highlightDelaySeconds}
+              highlightDurationSeconds={highlightDurationSeconds}
+              highlightStaggerSeconds={highlightStaggerSeconds}
             />
           </div>
 
@@ -816,10 +940,10 @@ export const QuoteVideo = ({
               style={{
                 display: 'flex',
                 flexDirection: 'column',
-                gap: 8 * s,
+                gap: 2 * s,
                 alignItems: alignItem,
-                opacity: fade,
                 textShadow: shadow,
+                ...softElementEnter,
               }}
             >
               {authorText && (
@@ -862,7 +986,9 @@ export const QuoteVideo = ({
     const left = 542 * s;
     const right = 3447 * s;
     const baseline = 1426 * s;
-    const footerHeight = 120 * s; // Logo size 120px
+    const footerLogoFontSize = 96;
+    const footerLogoHeight = footerLogoFontSize * 1.5 * s;
+    const footerBottom = 1920 * s - baseline;
 
     const {size: titleFontSize, line: titleLineHeight} = getNews2x1Metrics(contentText, s * mainTextScale);
 
@@ -889,7 +1015,7 @@ export const QuoteVideo = ({
             text={contentText}
             style={{
               fontSize: titleFontSize,
-              lineHeight: `${titleLineHeight}px`,
+              lineHeight: `${titleLineHeight * mainLineScale}px`,
               fontWeight: 500,
               color: colors.white,
               letterSpacing: '-0.01em',
@@ -897,6 +1023,8 @@ export const QuoteVideo = ({
             }}
             s={s}
             highlightDelaySeconds={highlightDelaySeconds}
+            highlightDurationSeconds={highlightDurationSeconds}
+            highlightStaggerSeconds={highlightStaggerSeconds}
           />
         </div>
 
@@ -905,8 +1033,8 @@ export const QuoteVideo = ({
           style={{
             position: 'absolute',
             left,
-            top: baseline - 120 * s,
-            opacity: fade,
+            top: baseline - footerLogoHeight,
+            ...softElementEnter,
           }}
         >
           <Logo
@@ -915,8 +1043,8 @@ export const QuoteVideo = ({
             isBadge={false}
             s={s}
             shadow={shadow}
-            fontSize={120}
-            lineHeight={120}
+            fontSize={footerLogoFontSize}
+            lineHeight={footerLogoFontSize}
           />
         </div>
 
@@ -926,15 +1054,15 @@ export const QuoteVideo = ({
             style={{
               position: 'absolute',
               right: (3840 - 3447) * s,
-              top: baseline - 82 * s,
+              bottom: footerBottom,
               fontSize: 80 * s,
               lineHeight: `${82 * s}px`,
               fontWeight: 500,
               color: '#686868',
               letterSpacing: '-0.01em',
               textAlign: 'right',
-              opacity: fade,
               textShadow: shadow,
+              ...softElementEnter,
             }}
           >
             {dateText}
@@ -949,6 +1077,9 @@ export const QuoteVideo = ({
   const left = 542 * s;
   const right = 3447 * s;
   const baseline = 1426 * s;
+  const footerLogoFontSize = 96;
+  const footerLogoHeight = footerLogoFontSize * 1.5 * s;
+  const footerBottom = 1920 * s - baseline;
 
   const authorLines = [authorText, roleText || dateText].filter(Boolean);
   const {size: quoteFontSize, line: quoteLineHeight} = getQuote2x1Metrics(contentText, s * mainTextScale);
@@ -1000,7 +1131,7 @@ export const QuoteVideo = ({
           text={contentText}
           style={{
             fontSize: quoteFontSize,
-            lineHeight: `${quoteLineHeight}px`,
+            lineHeight: `${quoteLineHeight * mainLineScale}px`,
             fontWeight: 500,
             color: colors.white,
             letterSpacing: '-0.01em',
@@ -1008,6 +1139,8 @@ export const QuoteVideo = ({
           }}
           s={s}
           highlightDelaySeconds={highlightDelaySeconds}
+          highlightDurationSeconds={highlightDurationSeconds}
+          highlightStaggerSeconds={highlightStaggerSeconds}
         />
       </div>
 
@@ -1016,8 +1149,8 @@ export const QuoteVideo = ({
         style={{
           position: 'absolute',
           left,
-          top: baseline - 120 * s,
-          opacity: fade,
+          top: baseline - footerLogoHeight,
+          ...softElementEnter,
         }}
       >
         <Logo
@@ -1026,8 +1159,8 @@ export const QuoteVideo = ({
           isBadge={isBadge}
           s={s}
           shadow={shadow}
-          fontSize={120}
-          lineHeight={120}
+          fontSize={footerLogoFontSize}
+          lineHeight={footerLogoFontSize}
         />
       </div>
 
@@ -1037,20 +1170,20 @@ export const QuoteVideo = ({
           style={{
             position: 'absolute',
             right: (3840 - 3447) * s,
-            bottom: (1920 - 1426) * s, // Align bottom to baseline
+            bottom: footerBottom,
             display: 'flex',
             flexDirection: 'column',
             alignItems: 'flex-end',
-            gap: 12 * s,
-            opacity: fade,
+            gap: 2 * s,
             textShadow: shadow,
+            ...softElementEnter,
           }}
         >
           {authorText && (
             <div
               style={{
                 fontSize: 80 * s,
-                lineHeight: `${82 * s}px`,
+                lineHeight: `${90 * s}px`,
                 fontWeight: 500,
                 color: colors.white,
                 letterSpacing: '-0.01em',

@@ -105,6 +105,7 @@ const args = [
   preset.composition,
   output,
   `--props=${path.normalize(propsPath)}`,
+  '--timeout=300000',
   ...preset.args,
 ];
 

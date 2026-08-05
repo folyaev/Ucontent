@@ -30,6 +30,7 @@ services:
       - INSTANCE_NAME=UContent Search
 
   ucontent:
+    platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile
@@ -44,16 +45,28 @@ services:
       BASE_API_URL: http://telegram-bot-api:8081/bot
       BASE_FILE_URL: http://telegram-bot-api:8081/file
       RESEARCH_SEARXNG_URL: http://searxng:8080
+      SEARXNG_BASE_URL: http://searxng:8080
       UCONTENT_PYTHON: /app/.venv/bin/python
       UTRENDS_PYTHON: /app/.venv/bin/python
       PAMPAM_ROOT: /app/media
       MEDIA_DOWNLOAD_ROOT: /app/media
+      MEDIA_COOKIES_FROM_BROWSER: firefox:/app/firefox-profile
+      SCREENSHOT_COOKIES_PATH: /app/data/cookies.txt
+      MEDIA_YTDLP_JS_RUNTIME: deno:/usr/local/bin/deno
+      VOICE_TTS_URL: http://host.docker.internal:8765
       PYTHONIOENCODING: utf-8
       PYTHONUTF8: "1"
     ports:
       - "5197:5197"
+      - "9222:9222"
+      - "6080:6080"
     volumes:
       - ./data:/app/data
+      - C:/Users/Nemifist/AppData/Roaming/Mozilla/Firefox/Profiles/yja2tm34.default-release:/app/firefox-profile:ro
+      - C:/Users/Nemifist/YandexDisk/Foapp/Trends/trends.db:/app/tools/utrends/trends.db
+      - C:/Users/Nemifist/YandexDisk/Foapp/Trends/feeds.json:/app/tools/utrends/feeds.json:ro
+      - C:/Users/Nemifist/YandexDisk/Foapp/Trends/bloggers.json:/app/tools/utrends/bloggers.json:ro
+      - C:/Users/Nemifist/YandexDisk/Foapp/Trends/news_channels.json:/app/tools/utrends/news_channels.json:ro
       - "${PAMPAM_HOST_ROOT:-./media}:/app/media"
       - telegram_bot_api_data:/var/lib/telegram-bot-api
 

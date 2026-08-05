@@ -421,16 +421,6 @@ button:disabled {
   background: rgba(138, 180, 248, 0.12);
 }
 
-.content-segment .content-segment-toolbar {
-  opacity: 0;
-  transition: opacity 120ms ease;
-}
-
-.content-segment:hover .content-segment-toolbar,
-.content-segment:focus-within .content-segment-toolbar {
-  opacity: 1;
-}
-
 .content-segment-toolbar {
   position: absolute;
   top: 2px;
@@ -438,12 +428,34 @@ button:disabled {
   z-index: 2;
   display: flex;
   align-items: center;
+  gap: 0;
+}
+
+.segment-menu-toggle {
+  opacity: 0.42;
+}
+
+.content-segment:hover .segment-menu-toggle,
+.content-segment.is-menu-open .segment-menu-toggle {
+  opacity: 1;
+}
+
+.segment-action-menu {
+  position: absolute;
+  top: 0;
+  right: 32px;
+  display: none;
+  align-items: center;
   gap: 3px;
   padding: 2px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--toolbar-bg);
   box-shadow: 0 1px 4px var(--shadow);
+}
+
+.content-segment.is-menu-open .segment-action-menu {
+  display: flex;
 }
 
 .content-segment-toolbar span {

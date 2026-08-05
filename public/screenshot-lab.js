@@ -1,11 +1,13 @@
 const statusEl = document.querySelector("#shotlab-status");
 const formEl = document.querySelector("#shotlab-form");
 const scrapeInput = document.querySelector("#shotlab-scrape");
+const scrapeListEl = document.querySelector("#shotlab-scrapes-list");
 const presetEl = document.querySelector("#shotlab-preset");
 const heightInput = document.querySelector("#shotlab-height");
 const zoomInput = document.querySelector("#shotlab-zoom");
 const scrollInput = document.querySelector("#shotlab-scroll");
 const captureButton = document.querySelector("#shotlab-capture");
+const sessionButton = document.querySelector("#shotlab-session");
 const manualButton = document.querySelector("#shotlab-manual");
 const listEl = document.querySelector("#shotlab-list");
 const titleEl = document.querySelector("#shotlab-title");
@@ -21,13 +23,21 @@ const PRESETS = {
 };
 const PRESET_ORDER = ["16x9", "2x1", "1x1"];
 
-let scrapeId = new URLSearchParams(window.location.search).get("scrape") || "POKOLENIYA";
+let scrapeId = new URLSearchParams(window.location.search).get("scrape") || "";
 let links = [];
 let selectedIndex = 0;
 let objectUrl = "";
+let browserSessionRunning = false;
 
 function setStatus(text) {
   statusEl.textContent = text;
+}
+
+function updateSessionButton() {
+  if (!sessionButton) return;
+  sessionButton.textContent = browserSessionRunning ? "Stop Session" : "Session";
+  sessionButton.classList.toggle("is-active", browserSessionRunning);
+  captureButton.disabled = browserSessionRunning;
 }
 
 function escapeHtml(value) {
@@ -183,12 +193,34 @@ function render() {
   showExistingScreenshot(item);
 }
 
+async function refreshScrapeOptions() {
+  if (!scrapeListEl) return;
+  const response = await fetch("/api/scrapes");
+  if (!response.ok) return;
+  const data = await response.json();
+  const items = Array.isArray(data.scrapes) ? data.scrapes : [];
+  scrapeListEl.innerHTML = "";
+  for (const item of items) {
+    const option = document.createElement("option");
+    option.value = item.id || "";
+    option.label = `${item.title || item.id || "Untitled"} ${item.updated_at || item.created_at || ""}`.trim();
+    scrapeListEl.append(option);
+  }
+}
+
 async function loadLinks() {
   scrapeInput.value = scrapeId;
   setStatus("loading links");
   const response = await fetch(`/api/screenshot-lab/links?scrape=${encodeURIComponent(scrapeId)}`);
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  scrapeId = data.scrape?.id || scrapeId;
+  scrapeInput.value = scrapeId;
+  if (scrapeId) {
+    const url = new URL(window.location.href);
+    url.searchParams.set("scrape", scrapeId);
+    window.history.replaceState(null, "", url);
+  }
   links = Array.isArray(data.links) ? data.links : [];
   selectedIndex = 0;
   setStatus(`${data.scrape?.id || scrapeId}: ${links.length} links`);
@@ -229,11 +261,57 @@ async function captureSelected() {
     }
     setStatus("screenshot ready");
   } catch (error) {
+    revokeImage();
+    imageEl.removeAttribute("src");
+    imageEl.hidden = true;
+    downloadEl.hidden = true;
     emptyEl.hidden = false;
     emptyEl.textContent = `Ошибка: ${error.message}`;
     setStatus("capture failed");
   } finally {
-    captureButton.disabled = false;
+    captureButton.disabled = browserSessionRunning;
+    void refreshBrowserSessionStatus().catch(() => null);
+  }
+}
+
+async function refreshBrowserSessionStatus() {
+  const response = await fetch("/api/browser-session");
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  browserSessionRunning = Boolean(data.running);
+  updateSessionButton();
+  return data;
+}
+
+async function toggleBrowserSession() {
+  if (!sessionButton) return;
+  sessionButton.disabled = true;
+  try {
+    const current = await refreshBrowserSessionStatus();
+    if (current.running) {
+      const response = await fetch("/api/browser-session", { method: "DELETE" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      browserSessionRunning = Boolean(data.running);
+      updateSessionButton();
+      setStatus("browser session stopped");
+      return;
+    }
+    const item = selectedLink();
+    const params = new URLSearchParams();
+    if (item?.url) params.set("url", item.url);
+    const response = await fetch(`/api/browser-session${params.size ? `?${params.toString()}` : ""}`, { method: "POST" });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    browserSessionRunning = Boolean(data.running);
+    updateSessionButton();
+    setStatus("browser session ready");
+    const sessionUrl = data.vnc_url || data.devtools_url || "";
+    if (sessionUrl) window.open(sessionUrl, "ucontent_browser_session", "popup=yes,width=1280,height=900,left=80,top=60,resizable=yes,scrollbars=yes");
+  } catch (error) {
+    setStatus(error.message || "browser session failed");
+  } finally {
+    sessionButton.disabled = false;
   }
 }
 
@@ -249,21 +327,25 @@ function openManualWindow() {
 
 formEl.addEventListener("submit", (event) => {
   event.preventDefault();
-  scrapeId = scrapeInput.value.trim() || "POKOLENIYA";
+  scrapeId = scrapeInput.value.trim();
   const url = new URL(window.location.href);
-  url.searchParams.set("scrape", scrapeId);
+  if (scrapeId) url.searchParams.set("scrape", scrapeId);
+  else url.searchParams.delete("scrape");
   window.history.replaceState(null, "", url);
   void loadLinks().catch((error) => setStatus(error.message));
 });
 
 presetEl.addEventListener("change", applyPreset);
 captureButton.addEventListener("click", () => void captureSelected());
+sessionButton?.addEventListener("click", () => void toggleBrowserSession());
 manualButton.addEventListener("click", openManualWindow);
 for (const button of document.querySelectorAll("[data-shot-action]")) {
   button.addEventListener("click", () => mutateProfile(button.dataset.shotAction || ""));
 }
 
 applyPreset();
+void refreshBrowserSessionStatus().catch(() => null);
+void refreshScrapeOptions().catch(() => null);
 void loadLinks().catch((error) => {
   setStatus(error.message);
   listEl.innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`;

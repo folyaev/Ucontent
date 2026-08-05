@@ -1,4 +1,4 @@
-﻿// notion-scraper.js
+// notion-scraper.js
 import puppeteer from 'puppeteer';
 import fs from 'fs';
 import path from 'path';
@@ -79,6 +79,11 @@ export async function scrapeNotionPage(url, onProgress = () => {}) {
       waitUntil: 'networkidle2', 
       timeout: 60000 
     });
+
+    const pageTitle = await page.title().catch(() => '');
+    if (/just a moment|cloudflare|verify you are human|attention required/i.test(pageTitle)) {
+      throw new Error(`Notion page blocked by Cloudflare challenge (${pageTitle})`);
+    }
 
     const scriptContent = fs.readFileSync(
       path.join(__dirname, 'notion-script.js'), 

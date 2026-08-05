@@ -4,11 +4,10 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { createHash } from "node:crypto";
 const execFileAsync = promisify(execFile);
 
-
-// Default Token for @utcontentbot if not specified in env
-const DEFAULT_TOKEN = "8668449496:AAGiTFs0j2tR4apeHDk-g0AMek8Ud4ZNjGw";
+const SCREENSHOT_BROWSER_PROFILE_DIR = process.env.SCREENSHOT_BROWSER_PROFILE_DIR || path.join(process.cwd(), "data", "browser-profile");
 
 let rawBaseApi = process.env.TELEGRAM_BASE_API_URL || process.env.BASE_API_URL || "http://127.0.0.1:8081/bot";
 if (rawBaseApi.includes("://tgbotapi:")) {
@@ -35,6 +34,10 @@ const NOTION_REFRESH_INTERVAL_MS = Number.isFinite(configuredNotionRefreshInterv
   ? Math.max(60 * 1000, configuredNotionRefreshInterval)
   : 5 * 60 * 1000;
 const downloadProbeCache = new Map();
+const telegramMediaGroupBuffers = new Map();
+const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
+const voiceScrapeRefreshCache = new Map();
+const VOICE_NOTION_REFRESH_TTL_MS = Number(process.env.VOICE_NOTION_REFRESH_TTL_MS || 2 * 60 * 1000);
 
 /**
  * Loads the active telegram session from tg-session.json
@@ -55,13 +58,18 @@ async function loadSession(dataDir) {
       sdvgMaxMode: false, // only show segments starting with /
       screenshotLabMode: false, // only show segments with links for screenshot capture
       shotCtx: null,
+      pagePreviewCtx: null,
+      pagePreviewTargets: [],
       timecodeCtx: null,
       renameCtx: null,
       renameTargets: [],
       screenshotTargets: [],
       folderMoveContexts: {},
       folderCreateCtx: null,
+      currentDownloadFolder: "",
+      mediaSearchCtx: null,
       remotionCtx: null,
+      voiceTopicCtx: null,
       remotionDefaults: {},
       logoPickCtx: null,
       remotionRenders: [],
@@ -69,6 +77,8 @@ async function loadSession(dataDir) {
       trimJobs: {},
       trimInputCtx: null,
       searchCtx: null,
+      findMissingCtx: null,
+      findMissingQueryCtx: null,
       sdvgActive: false,
       notionBaselineScrapeId: "",
       notionKnownSegmentIds: [],
@@ -83,7 +93,11 @@ async function loadSession(dataDir) {
     ? currentSession.folderMoveContexts
     : {};
   currentSession.folderCreateCtx = currentSession.folderCreateCtx || null;
+  currentSession.currentDownloadFolder = String(currentSession.currentDownloadFolder || "");
+  currentSession.pagePreviewCtx = currentSession.pagePreviewCtx || null;
+  currentSession.pagePreviewTargets = Array.isArray(currentSession.pagePreviewTargets) ? currentSession.pagePreviewTargets : [];
   currentSession.remotionCtx = currentSession.remotionCtx || null;
+  currentSession.voiceTopicCtx = currentSession.voiceTopicCtx || null;
   currentSession.remotionDefaults = currentSession.remotionDefaults && typeof currentSession.remotionDefaults === "object" && !Array.isArray(currentSession.remotionDefaults)
     ? currentSession.remotionDefaults
     : {};
@@ -93,6 +107,8 @@ async function loadSession(dataDir) {
   currentSession.cutJobs = currentSession.cutJobs && typeof currentSession.cutJobs === "object" ? currentSession.cutJobs : {};
   currentSession.trimJobs = currentSession.trimJobs && typeof currentSession.trimJobs === "object" ? currentSession.trimJobs : {};
   currentSession.trimInputCtx = currentSession.trimInputCtx || null;
+  currentSession.findMissingCtx = currentSession.findMissingCtx || null;
+  currentSession.findMissingQueryCtx = currentSession.findMissingQueryCtx || null;
   currentSession.sdvgActive = currentSession.sdvgActive === undefined
     ? Boolean(currentSession.scrapeId && !currentSession.downloadMode)
     : Boolean(currentSession.sdvgActive);
@@ -139,6 +155,7 @@ async function callApi(token, method, body = {}) {
 const SCREENSHOT_SCRIPT_PATH = process.env.UCONTENT_SCREENSHOT_SCRIPT ||
   path.resolve(process.cwd(), "tools", "screenshot-engine", "link-screenshot.js");
 const TELEGRAM_CAPTION_MAX = 1024;
+const GENERATED_MEDIA_FILENAME_MAX = 180;
 
 function mediaUploadContentType(fileName) {
   const ext = path.extname(String(fileName || "")).toLowerCase();
@@ -290,6 +307,17 @@ function defaultShotProfileForScrape(scrapeId = "") {
   return normShotProfile(preset || {});
 }
 
+function defaultShotProfileForUrl(rawUrl, scrapeId = "") {
+  const profile = defaultShotProfileForScrape(scrapeId);
+  try {
+    const host = new URL(String(rawUrl || "")).hostname.toLowerCase().replace(/^www\./, "");
+    if (host === "vedomosti.ru" || host.endsWith(".vedomosti.ru")) {
+      return normShotProfile({ ...profile, zoom: 400 });
+    }
+  } catch {}
+  return profile;
+}
+
 function shotProfileKey(p)  { const n = normShotProfile(p); return `${n.width}x${n.height}@${n.zoom}S${n.scroll}`; }
 function shotProfileLabel(p){ const n = normShotProfile(p); return `${n.width}×${n.height} @ ${n.zoom}%${n.scroll ? ` ↓${n.scroll}px` : ""}`; }
 
@@ -335,6 +363,215 @@ function buildShotKeyboard() {
       ]
     ]
   };
+}
+
+function buildPagePreviewKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "\uD83D\uDCF8 Скриншот", callback_data: "sdvg:preview:screenshot" },
+        { text: "\u2715", callback_data: "sdvg:preview:close" }
+      ]
+    ]
+  };
+}
+
+function rememberPagePreviewContext({ url, scrapeId = "", segmentId = "", topic = "", sourceMessageId = null, standalone = false, messageId = null }) {
+  const ctx = {
+    url: String(url || "").trim(),
+    scrapeId: String(scrapeId || ""),
+    segmentId: String(segmentId || ""),
+    topic: cleanupCaptionText(topic || "unsorted") || "unsorted",
+    sourceMessageId,
+    standalone: Boolean(standalone),
+    messageId,
+    createdAt: new Date().toISOString()
+  };
+  currentSession.pagePreviewCtx = ctx;
+  if (messageId) {
+    const existing = Array.isArray(currentSession.pagePreviewTargets) ? currentSession.pagePreviewTargets : [];
+    currentSession.pagePreviewTargets = [
+      ctx,
+      ...existing.filter((item) => Number(item?.messageId || 0) !== Number(messageId))
+    ].slice(0, 40);
+  }
+  return ctx;
+}
+
+function findPagePreviewContext(messageId) {
+  const numericMessageId = Number(messageId || 0);
+  const targets = Array.isArray(currentSession.pagePreviewTargets) ? currentSession.pagePreviewTargets : [];
+  const match = targets.find((item) => Number(item?.messageId || 0) === numericMessageId);
+  if (match?.url) return match;
+  if (currentSession.pagePreviewCtx?.url && (!numericMessageId || Number(currentSession.pagePreviewCtx.messageId || 0) === numericMessageId)) {
+    return currentSession.pagePreviewCtx;
+  }
+  return null;
+}
+
+async function startPagePreview(token, chatId, rawUrl, {
+  scrapeId = "",
+  segmentId = "",
+  topic = "",
+  sourceMessageId = null,
+  standalone = false
+} = {}) {
+  const url = String(rawUrl || "").trim();
+  if (!url) return;
+  const topicLabel = cleanupCaptionText(topic || "unsorted") || "unsorted";
+  const sent = await callApi(token, "sendMessage", {
+    chat_id: chatId,
+    text: [
+      `\uD83D\uDD17 <b>Превью страницы</b>`,
+      sourceSiteLinkHtml(url),
+      topicLabel ? `\uD83D\uDCC1 ${escapeHtml(topicLabel)}` : "",
+      "",
+      "Если нужен кадр страницы, нажмите <b>Скриншот</b>."
+    ].filter(Boolean).join("\n"),
+    parse_mode: "HTML",
+    disable_web_page_preview: false,
+    reply_markup: buildPagePreviewKeyboard()
+  });
+  rememberPagePreviewContext({
+    url,
+    scrapeId,
+    segmentId,
+    topic: topicLabel,
+    sourceMessageId,
+    standalone: Boolean(standalone),
+    messageId: sent?.message_id || null
+  });
+  await saveSession(botContext.DATA_DIR, currentSession);
+}
+
+async function saveLinkPreviewImageToTopic(token, chatId, { url, safeTopic, dir, scrape = null, segmentIndex = -1, sourceMessageId = null, standalone = false }) {
+  try {
+    const previewRes = await fetch(`${UCONTENT_SELF_URL}/api/link-preview?url=${encodeURIComponent(url)}`, { signal: AbortSignal.timeout(8000) });
+    if (!previewRes.ok) return null;
+    const preview = await previewRes.json();
+    const ogImage = preview.image;
+    if (!ogImage || !/^https?:\/\//i.test(ogImage)) return null;
+    const imgRes = await fetch(ogImage, { redirect: "follow", signal: AbortSignal.timeout(12000) });
+    if (!imgRes.ok) return null;
+    const imgBuf = Buffer.from(await imgRes.arrayBuffer());
+    if (!imgBuf.length) return null;
+    const imgExt = ogImage.split("?")[0].match(/\.(png|jpe?g|webp|gif)$/i)?.[1] ?? "jpg";
+    const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+    const suffix = Math.random().toString(36).slice(2, 8);
+    const thumbName = await ensureUniqueFileNameInDir(dir, safeTelegramUploadFileName(`preview_${hostLabelForFileName(url)}_${stamp}_${suffix}.${imgExt}`, "preview.jpg"));
+    const thumbPath = path.join(dir, thumbName);
+    await fs.writeFile(thumbPath, imgBuf);
+    const relPath = `${safeTopic}/${thumbName}`;
+    const mediaItem = {
+      path: relPath,
+      name: thumbName,
+      topic: safeTopic,
+      size: imgBuf.length,
+      source_url: url,
+      webpage_url: url,
+      title: `Preview ${hostLabelForFileName(url)}`,
+      updated_at: new Date().toISOString(),
+      thumbnail: `/api/media/raw?path=${encodeURIComponent(relPath)}`
+    };
+    let mediaIndex = -1;
+    if (scrape && segmentIndex >= 0 && scrape.segments?.[segmentIndex]) {
+      const items = Array.isArray(scrape.segments[segmentIndex].media_items) ? scrape.segments[segmentIndex].media_items : [];
+      items.push(mediaItem);
+      mediaIndex = items.length - 1;
+      scrape.segments[segmentIndex].media_items = items;
+      scrape.segments[segmentIndex].media = scrape.segments[segmentIndex].media || mediaItem;
+      scrape.segments[segmentIndex].updated_at = new Date().toISOString();
+      await botContext.writeScrape(scrape);
+    }
+    await botContext.upsertMediaMetadata?.(relPath, {
+      derivation: "link-preview",
+      source_url: url,
+      title: mediaItem.title,
+      size: imgBuf.length,
+      segment_id: scrape?.segments?.[segmentIndex]?.id || ""
+    }).catch(() => null);
+    const segmentId = scrape?.segments?.[segmentIndex]?.id || "";
+    const renameId = rememberRenameTarget(relPath, segmentId, mediaIndex, url);
+    rememberPagePreviewContext({
+      url,
+      scrapeId: scrape?.id || "",
+      segmentId,
+      topic: safeTopic,
+      sourceMessageId,
+      standalone: Boolean(standalone || !scrape?.id)
+    });
+    await saveSession(botContext.DATA_DIR, currentSession);
+    const sentMessage = await sendLocalMedia(token, {
+      chat_id: chatId,
+      caption: `🖼 <b>Preview</b>\n${sourceSiteLinkHtml(url)}\n📦 ${escapeHtml(formatBytes(imgBuf.length))}\n📁 ${escapeHtml(safeTopic)}`,
+      parse_mode: "HTML",
+      reply_markup: renameButtonMarkup(renameId, [[
+        { text: "\uD83D\uDCF8 Скриншот", callback_data: "sdvg:preview:screenshot" }
+      ]])
+    }, thumbPath, thumbName);
+    if (sentMessage?.message_id) {
+      attachRenameTargetMessage(renameId, chatId, sentMessage.message_id);
+      if (currentSession.pagePreviewCtx?.url === String(url || "").trim()) {
+        currentSession.pagePreviewCtx.messageId = sentMessage.message_id;
+        const existing = Array.isArray(currentSession.pagePreviewTargets) ? currentSession.pagePreviewTargets : [];
+        currentSession.pagePreviewTargets = [
+          currentSession.pagePreviewCtx,
+          ...existing.filter((item) => Number(item?.messageId || 0) !== Number(sentMessage.message_id))
+        ].slice(0, 40);
+      }
+      await saveSession(botContext.DATA_DIR, currentSession);
+    }
+    return { relPath, path: thumbPath, name: thumbName };
+  } catch (err) {
+    console.error("[bot] og:image preview fetch failed:", err.message);
+    return null;
+  }
+}
+
+async function sendPagePreviewForSegment(token, chatId, scrape, segment, segmentIndex, url, sourceMessageId = null) {
+  const safeTopic = botContext.sanitizeMediaTopicName(segment?.topic || "unsorted");
+  const { dir } = await botContext.ensureTopicDir(safeTopic);
+  const saved = await saveLinkPreviewImageToTopic(token, chatId, {
+    url,
+    safeTopic,
+    dir,
+    scrape,
+    segmentIndex,
+    sourceMessageId,
+    standalone: false
+  });
+  if (saved) {
+    await sendOrEditCard(token, currentSession, scrape, scrape.segments?.[segmentIndex] || segment).catch(() => null);
+    return saved;
+  }
+  await startPagePreview(token, chatId, url, {
+    scrapeId: scrape?.id || currentSession.scrapeId || "",
+    segmentId: segment?.id || "",
+    topic: safeTopic,
+    sourceMessageId,
+    standalone: false
+  });
+  return null;
+}
+
+async function sendStandalonePagePreview(token, chatId, url, sourceMessageId = null) {
+  const topic = await resolveCurrentDownloadTopic();
+  const topicLabel = topic || "unsorted";
+  const { safeTopic, dir } = await botContext.ensureTopicDir(topic);
+  const saved = await saveLinkPreviewImageToTopic(token, chatId, {
+    url,
+    safeTopic,
+    dir,
+    sourceMessageId,
+    standalone: true
+  });
+  if (saved) return saved;
+  await startPagePreview(token, chatId, url, {
+    topic: topicLabel,
+    sourceMessageId,
+    standalone: true
+  });
+  return null;
 }
 
 /**
@@ -476,6 +713,56 @@ function candidateDownloadFileNames(meta = {}) {
   return [...names].filter(Boolean);
 }
 
+function parseDownloaderExtraArgs(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return [];
+  if (raw.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.map((item) => String(item)).filter(Boolean) : [];
+    } catch {
+      return [];
+    }
+  }
+  const matches = raw.match(/"([^"]*)"|'([^']*)'|[^\s]+/g) || [];
+  return matches.map((item) => item.replace(/^"|"$/g, "").replace(/^'|'$/g, "")).filter(Boolean);
+}
+
+function ytDlpJsRuntimeArgs() {
+  const defaultRuntime = existsSync("/usr/local/bin/deno") ? "deno:/usr/local/bin/deno" : "node";
+  const runtime = String(process.env.MEDIA_YTDLP_JS_RUNTIME || defaultRuntime).trim();
+  if (!runtime || /^(0|false|off|none)$/i.test(runtime)) return [];
+  return ["--js-runtimes", runtime];
+}
+
+function dockerBrowserCookiesFromBrowserArg() {
+  const cookiesDb = path.join(SCREENSHOT_BROWSER_PROFILE_DIR, "Default", "Cookies");
+  if (!existsSync(cookiesDb)) return "";
+  return `chrome:${SCREENSHOT_BROWSER_PROFILE_DIR}`;
+}
+
+function dockerFirefoxCookiesFromBrowserArg() {
+  const profileDir = path.join(process.cwd(), "data", "firefox-profile");
+  const cookiesDb = path.join(profileDir, "cookies.sqlite");
+  if (!existsSync(cookiesDb)) return "";
+  return `firefox:${profileDir}`;
+}
+
+function applyYtDlpSharedArgs(args, insertIndex = args.length) {
+  const cookiesPath = String(process.env.MEDIA_COOKIES_PATH || "").trim();
+  const cookiesFromBrowser = String(process.env.MEDIA_COOKIES_FROM_BROWSER || "").trim();
+  const dockerFirefoxCookies = !cookiesFromBrowser ? dockerFirefoxCookiesFromBrowserArg() : "";
+  const dockerCookiesFromBrowser = !cookiesPath && !cookiesFromBrowser ? dockerBrowserCookiesFromBrowserArg() : "";
+  const extraArgs = parseDownloaderExtraArgs(process.env.MEDIA_YTDLP_EXTRA_ARGS);
+  const shared = [];
+  if (cookiesFromBrowser) shared.push("--cookies-from-browser", cookiesFromBrowser);
+  else if (dockerFirefoxCookies) shared.push("--cookies-from-browser", dockerFirefoxCookies);
+  else if (cookiesPath) shared.push("--cookies", cookiesPath);
+  else if (dockerCookiesFromBrowser) shared.push("--cookies-from-browser", dockerCookiesFromBrowser);
+  shared.push(...extraArgs);
+  if (shared.length) args.splice(insertIndex, 0, ...shared);
+}
+
 async function probeDownloadMetadata(rawUrl) {
   const url = normalizeVkDownloadUrl(rawUrl);
   const cacheKey = normalizeDownloadUrlForCompare(url);
@@ -491,13 +778,11 @@ async function probeDownloadMetadata(rawUrl) {
       "--no-playlist",
       "--playlist-end", "1",
       "--socket-timeout", "15",
+      ...ytDlpJsRuntimeArgs(),
       "--dump-single-json",
       url
     ];
-    const cookiesPath = String(process.env.MEDIA_COOKIES_PATH || "").trim();
-    const cookiesFromBrowser = String(process.env.MEDIA_COOKIES_FROM_BROWSER || "").trim();
-    if (cookiesPath) args.splice(args.length - 1, 0, "--cookies", cookiesPath);
-    else if (cookiesFromBrowser) args.splice(args.length - 1, 0, "--cookies-from-browser", cookiesFromBrowser);
+    applyYtDlpSharedArgs(args, args.length - 1);
     const { stdout } = await execFileAsync(tools.yt_dlp_path, args, {
       windowsHide: true,
       timeout: 25_000,
@@ -829,6 +1114,7 @@ function looksGenericDownloaderTitle(value) {
   const stripped = normalized.replace(/["'`«»“”„]/g, "").replace(/[._\-\s]+/g, "");
   if (!stripped) return true;
   if (/^[a-z0-9_-]{6,16}$/i.test(normalized) && /[0-9_-]/.test(normalized) && /[a-z]/i.test(normalized)) return true;
+  if (/^(?:image|img|photo|screenshot|screen|document|file|media|download)(?:[_-]?\d{4}[-_]?\d{2}[-_]?\d{2}.*|\d*)$/i.test(normalized)) return true;
   if (/^[a-z0-9_-]{10,48}$/i.test(normalized) && /[0-9]/.test(normalized) && /(?:^|[_-])[a-f0-9]{3,}(?:[_-]|$)/i.test(normalized.replace(/[_-]?(cut|trim|final|out)$/i, ""))) return true;
   if (/^[a-z0-9_-]{10,40}$/i.test(normalized) && !/[аеёиоуыэюяaeiou]{2,}/i.test(normalized) && /[0-9]/.test(normalized)) return true;
   return [
@@ -843,7 +1129,8 @@ function looksGenericDownloaderTitle(value) {
     "видео",
     "файл",
     "медиа",
-    "скачанный файл"
+    "скачанный файл",
+    "\u0432\u0441\u0435\u0433\u0434\u0430 \u0432 \u0440\u0435\u0430\u043b\u044c\u043d\u043e\u043c \u0432\u0440\u0435\u043c\u0435\u043d\u0438"
   ].includes(normalized);
 }
 
@@ -855,7 +1142,10 @@ function extractHostLabel(rawUrl) {
   }
 }
 
-function buildSafeMediaTitle({ metadataTitle, metadataDescription, fileName, sourceUrl, isVideo }) {
+function buildSafeMediaTitle({ displayTitle, metadataTitle, metadataDescription, fileName, sourceUrl, isVideo }) {
+  const forcedTitle = cleanupCaptionText(displayTitle);
+  if (forcedTitle && !looksCorruptedText(forcedTitle)) return forcedTitle;
+
   const cleanedMetaTitle = cleanupCaptionText(metadataTitle);
   if (cleanedMetaTitle && !looksCorruptedText(cleanedMetaTitle) && !looksGenericDownloaderTitle(cleanedMetaTitle)) return cleanedMetaTitle;
 
@@ -884,6 +1174,12 @@ function safeSendFileNameFromMetadata(fileName, sourceUrl, metadata = {}, suffix
   const cleanSuffix = cleanupCaptionText(suffix);
   const stem = [title, uploader, cleanSuffix].filter(Boolean).join(" ");
   return safeTelegramUploadFileName(`${stem || "download"}${ext}`, "download");
+}
+
+function multiMediaFileSuffix(index, total) {
+  const count = Number(total || 0);
+  if (!Number.isFinite(count) || count <= 1) return "";
+  return String((Number(index) || 0) + 1).padStart(2, "0");
 }
 
 function normalizeUploaderLabel(value) {
@@ -938,6 +1234,7 @@ function buildReturnedMediaCaption({ fileName, sourceUrl, sizeBytes, metadata = 
   const mediaUrl = String(metadata?.webpage_url ?? sourceUrl ?? "").trim();
   const uploaderUrl = String(metadata?.uploader_url ?? mediaUrl).trim();
   const title = clipLabel(buildSafeMediaTitle({
+    displayTitle: metadata?.display_title,
     metadataTitle: metadata?.title,
     metadataDescription: metadata?.description,
     fileName,
@@ -978,6 +1275,10 @@ function safeTelegramUploadFileName(fileName, fallback = "media", topicPrefix = 
   return `${stem || fallback}${ext}`;
 }
 
+function premiereSafeMediaFileName(fileName, fallback = "media", topicPrefix = "") {
+  return safeTelegramUploadFileName(fileName, fallback, topicPrefix);
+}
+
 function isGenericMediaStem(stem) {
   const value = String(stem || "").toLowerCase().replace(/[_-]+/g, "");
   if (!value) return true;
@@ -1013,6 +1314,239 @@ async function ensureUniqueFileNameInDir(dir, fileName, currentName = "") {
     index += 1;
   }
   return candidate;
+}
+
+async function ensureUniqueBoundedFileNameInDir(dir, fileName, maxLength = GENERATED_MEDIA_FILENAME_MAX) {
+  const parsed = path.parse(String(fileName || "media.bin"));
+  const ext = parsed.ext || ".bin";
+  const maxStem = Math.max(12, Number(maxLength || GENERATED_MEDIA_FILENAME_MAX) - ext.length);
+  const baseStem = asciiFilePart(parsed.name || "media", "media").slice(0, maxStem).replace(/[._-]+$/g, "") || "media";
+  let index = 0;
+  while (true) {
+    const suffix = index > 0 ? `_${index}` : "";
+    const stemLimit = Math.max(1, maxStem - suffix.length);
+    const stem = `${baseStem.slice(0, stemLimit).replace(/[._-]+$/g, "") || "media"}${suffix}`;
+    const candidate = `${stem}${ext}`;
+    const target = path.join(dir, candidate);
+    const exists = await fs.access(target).then(() => true).catch(() => false);
+    if (!exists) return candidate;
+    index += 1;
+  }
+}
+
+const VOICE_TTS_MAX_CHARS = 6000;
+const VOICE_TOPIC_PAGE_SIZE = 8;
+
+function stripVoiceLinks(text) {
+  return String(text || "")
+    .replace(/https?:\/\/\S+/gi, "")
+    .replace(/\bwww\.\S+/gi, "");
+}
+
+function cleanupVoiceScriptText(text) {
+  const lines = String(text || "")
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => stripVoiceLinks(line).trim())
+    .filter((line) => line && !line.startsWith("/") && !/^\d+$/.test(line));
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function voiceTextForTopic(scrape, topic) {
+  const requestedTopic = String(topic || "unsorted");
+  const chunks = (scrape?.segments || [])
+    .filter((segment) => String(segment?.topic || "unsorted") === requestedTopic)
+    .map((segment) => cleanupVoiceScriptText(segment?.text || ""))
+    .filter(Boolean);
+  return chunks.join("\n\n").trim();
+}
+
+function voiceTopicOptions(scrape) {
+  const seen = new Set();
+  const topics = [];
+  for (const segment of scrape?.segments || []) {
+    const topic = String(segment?.topic || "unsorted").trim() || "unsorted";
+    if (seen.has(topic)) continue;
+    const text = voiceTextForTopic(scrape, topic);
+    if (!text) continue;
+    seen.add(topic);
+    topics.push({ topic, label: clipLabel(topic, 48), chars: Array.from(text).length });
+  }
+  return topics;
+}
+
+function voiceTopicKeyboard(topics, page = 0) {
+  const pages = Math.max(1, Math.ceil(topics.length / VOICE_TOPIC_PAGE_SIZE));
+  const currentPage = Math.max(0, Math.min(Number(page) || 0, pages - 1));
+  const slice = topics.slice(currentPage * VOICE_TOPIC_PAGE_SIZE, (currentPage + 1) * VOICE_TOPIC_PAGE_SIZE);
+  const rows = slice.map((item, index) => [{
+    text: item.chars > VOICE_TTS_MAX_CHARS ? `${item.label} (${VOICE_TTS_MAX_CHARS}+ симв.)` : item.label,
+    callback_data: `sdvg:voice:topic:${currentPage * VOICE_TOPIC_PAGE_SIZE + index}`
+  }]);
+  if (pages > 1) {
+    rows.push([
+      { text: "<", callback_data: `sdvg:voice:page:${Math.max(0, currentPage - 1)}` },
+      { text: `${currentPage + 1}/${pages}`, callback_data: "sdvg:voice:noop" },
+      { text: ">", callback_data: `sdvg:voice:page:${Math.min(pages - 1, currentPage + 1)}` }
+    ]);
+  }
+  rows.push([{ text: "\u2716", callback_data: "sdvg:voice:close" }]);
+  return { inline_keyboard: rows };
+}
+
+async function readFreshVoiceScrape(scrapeId = "", options = {}) {
+  const id = String(scrapeId || currentSession.scrapeId || "").trim();
+  const cacheKey = id || "__latest__";
+  const cached = voiceScrapeRefreshCache.get(cacheKey);
+  const ttlMs = Math.max(0, Number(VOICE_NOTION_REFRESH_TTL_MS) || 0);
+  if (!options.force && cached && ttlMs > 0 && Date.now() - Number(cached.refreshedAt || 0) < ttlMs) {
+    return botContext.readScrape(id || "");
+  }
+  if (id && typeof botContext?.refreshScrapeFromNotion === "function") {
+    try {
+      const result = await runWithTimeout(
+        botContext.refreshScrapeFromNotion(id),
+        Number(options.timeoutMs || process.env.VOICE_NOTION_REFRESH_TIMEOUT_MS || 12_000),
+        "Notion refresh timed out"
+      );
+      if (result?.scrape?.id) {
+        const refreshedAt = Date.now();
+        voiceScrapeRefreshCache.set(cacheKey, { refreshedAt });
+        voiceScrapeRefreshCache.set(result.scrape.id, { refreshedAt });
+        return result.scrape;
+      }
+    } catch (error) {
+      console.warn(`[bot-voice] Notion refresh skipped for ${id}: ${error.message}`);
+      if (options.throwOnRefreshFailure) throw error;
+    }
+  }
+  return botContext.readScrape(id || "");
+}
+
+function boundedVoiceText(text) {
+  const chars = Array.from(String(text || "").trim());
+  if (chars.length <= VOICE_TTS_MAX_CHARS) {
+    return { text: chars.join(""), truncated: false, originalLength: chars.length };
+  }
+  return {
+    text: chars.slice(0, VOICE_TTS_MAX_CHARS).join("").trimEnd(),
+    truncated: true,
+    originalLength: chars.length
+  };
+}
+
+function voiceFileStamp() {
+  return new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+}
+
+function voiceTextHash(text) {
+  return createHash("sha1").update(cleanupVoiceScriptText(text), "utf8").digest("hex").slice(0, 12);
+}
+
+async function topicHasSavedVoiceWav(topic, text = "") {
+  const hash = voiceTextHash(text);
+  if (!hash || hash === "356a192b7913") return false;
+  const safeTopic = botContext.sanitizeMediaTopicName(String(topic || "unsorted"));
+  const dir = path.join(botContext.PAMPAM_ROOT, safeTopic);
+  const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isFile() || !/^voice[_-].*\.wav$/i.test(entry.name)) continue;
+    if (entry.name.includes("356a192b7913")) continue;
+    const base = path.basename(entry.name, path.extname(entry.name));
+    if (hash && base.includes(hash)) return true;
+    const metaPath = path.join(dir, `${entry.name}.json`);
+    const meta = await fs.readFile(metaPath, "utf8").then((raw) => JSON.parse(raw)).catch(() => null);
+    if (hash && meta?.voice_text_hash === hash) return true;
+  }
+  return false;
+}
+
+function voiceTelegramFileName(topic, extension = ".mp3") {
+  const label = cleanupCaptionText(topic) || "voice";
+  return safeTelegramUploadFileName(`${label}${extension}`, `voice${extension}`);
+}
+
+async function generateAndSendVoice(token, chatId, targetText, options = {}) {
+  const limited = boundedVoiceText(targetText);
+  const progressLines = ["\uD83C\uDFA4 <b>Генерирую озвучку...</b>"];
+  if (options.topic) progressLines.push(`\uD83D\uDCC1 ${escapeHtml(options.topic)}`);
+  if (limited.truncated) progressLines.push(`\u26A0\uFE0F Текст длинный, озвучиваю первые ${VOICE_TTS_MAX_CHARS} символов из ${limited.originalLength}.`);
+  const progressMsg = await callApi(token, "sendMessage", {
+    chat_id: chatId,
+    text: progressLines.join("\n"),
+    parse_mode: "HTML"
+  });
+
+  const jobId = Date.now();
+  const tempDir = path.join(process.cwd(), "data");
+  const tempWavPath = path.join(tempDir, `voice_${jobId}.wav`);
+  const tempMp3Path = path.join(tempDir, `voice_${jobId}.mp3`);
+  try {
+    await fs.mkdir(tempDir, { recursive: true });
+    const serviceUrl = String(process.env.VOICE_TTS_URL || process.env.UCONTENT_TTS_URL || "http://tts:8765").replace(/\/$/, "");
+    const response = await fetch(`${serviceUrl}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: JSON.stringify({ text: limited.text, speed: 1.0 }),
+      signal: AbortSignal.timeout(Number(process.env.VOICE_TTS_TIMEOUT_MS || 20 * 60 * 1000))
+    });
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => "");
+      throw new Error(`TTS service HTTP ${response.status}: ${errorText.slice(0, 500)}`);
+    }
+    await fs.writeFile(tempWavPath, Buffer.from(await response.arrayBuffer()));
+
+    let savedWavPath = "";
+    if (options.saveTopic) {
+      const { safeTopic, dir } = await botContext.ensureTopicDir(options.saveTopic);
+      const textHash = voiceTextHash(limited.text);
+      const fileName = await ensureUniqueFileNameInDir(dir, safeTelegramUploadFileName(`voice_${safeTopic}_${textHash}_${voiceFileStamp()}.wav`, "voice.wav"));
+      savedWavPath = path.join(dir, fileName);
+      await fs.copyFile(tempWavPath, savedWavPath);
+      await fs.writeFile(`${savedWavPath}.json`, JSON.stringify({
+        type: "voice",
+        topic: safeTopic,
+        voice_text_hash: textHash,
+        chars: Array.from(limited.text).length,
+        original_chars: limited.originalLength,
+        truncated: limited.truncated,
+        created_at: new Date().toISOString()
+      }, null, 2), "utf8").catch(() => null);
+    }
+
+    const tools = await botContext.resolveDownloaderTools?.().catch(() => ({})) || {};
+    const ffmpeg = tools.ffmpeg_path || "ffmpeg";
+    await execFileAsync(ffmpeg, [
+      "-hide_banner", "-loglevel", "error", "-y",
+      "-i", tempWavPath,
+      "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-ar", "44100", "-ac", "1",
+      tempMp3Path
+    ], { windowsHide: true, timeout: 120_000 });
+
+    await callApi(token, "deleteMessage", { chat_id: chatId, message_id: progressMsg.message_id }).catch(() => null);
+
+    const mp3Name = voiceTelegramFileName(options.topic || options.saveTopic || "voice", ".mp3");
+    const title = clipLabel(cleanupCaptionText(options.topic || options.saveTopic || "Озвучка"), 64);
+    await callApiMultipart(token, "sendAudio", {
+      chat_id: chatId,
+      title,
+      caption: options.topic ? `\uD83C\uDFA4 ${escapeHtml(options.topic)}` : undefined,
+      parse_mode: options.topic ? "HTML" : undefined
+    }, "audio", tempMp3Path, mp3Name);
+    return { savedWavPath, sentMp3Path: tempMp3Path, truncated: limited.truncated };
+  } catch (error) {
+    console.error("[bot-voice] failed:", error.message);
+    await callApi(token, "editMessageText", {
+      chat_id: chatId,
+      message_id: progressMsg.message_id,
+      text: `\u274C <b>Ошибка генерации:</b> ${escapeHtml(error.message)}`,
+      parse_mode: "HTML"
+    }).catch(() => null);
+    throw error;
+  } finally {
+    await fs.unlink(tempWavPath).catch(() => null);
+    await fs.unlink(tempMp3Path).catch(() => null);
+  }
 }
 
 function metadataFromDownloadJob(job = {}) {
@@ -1105,7 +1639,7 @@ function formatCardText(scrape, segment, session, linkState = {}) {
   return msg;
 }
 
-async function startScreenshotPreview(token, chatId, scrape, segment, segmentIndex, url) {
+async function startScreenshotPreview(token, chatId, scrape, segment, segmentIndex, url, options = {}) {
   const safeTopic = botContext.sanitizeMediaTopicName(segment.topic || "unsorted");
   const { dir } = await botContext.ensureTopicDir(safeTopic);
   
@@ -1116,55 +1650,12 @@ async function startScreenshotPreview(token, chatId, scrape, segment, segmentInd
     parse_mode: "HTML"
   });
 
-  // Try fetching og:image first
-  try {
-    const previewRes = await fetch(`http://localhost:${botContext.PORT}/api/link-preview?url=${encodeURIComponent(url)}`, { signal: AbortSignal.timeout(8000) });
-    if (previewRes.ok) {
-      const preview = await previewRes.json();
-      const ogImage = preview.image;
-      if (ogImage && /^https?:\/\//i.test(ogImage)) {
-        const imgRes = await fetch(ogImage, { redirect: "follow", signal: AbortSignal.timeout(12000) });
-        if (imgRes.ok) {
-          const imgBuf = Buffer.from(await imgRes.arrayBuffer());
-          const imgExt = ogImage.split("?")[0].match(/\.(png|jpe?g|webp|gif)$/i)?.[1] ?? "jpg";
-          const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
-          const suffix = Math.random().toString(36).slice(2, 8);
-          const thumbName = `thumb_${stamp}_${suffix}.${imgExt}`;
-          const thumbPath = path.join(dir, thumbName);
-          await fs.writeFile(thumbPath, imgBuf);
-          const relPath = `${safeTopic}/${thumbName}`;
-          const mediaItem = {
-            path: relPath,
-            name: thumbName,
-            topic: safeTopic,
-            size: imgBuf.length,
-            updated_at: new Date().toISOString(),
-            thumbnail: `/api/media/raw?path=${encodeURIComponent(relPath)}`
-          };
-          const items = segment.media_items || [];
-          if (!items.some(it => it.name === thumbName)) {
-            items.push(mediaItem);
-            scrape.segments[segmentIndex].media_items = items;
-            scrape.segments[segmentIndex].media = items[0] || null;
-            scrape.segments[segmentIndex].updated_at = new Date().toISOString();
-            await botContext.writeScrape(scrape);
-
-            // Send as document/photo to show it has been successfully downloaded and attached
-            await sendLocalMedia(token, {
-              chat_id: chatId,
-              caption: `📸 <b>Скриншот</b>\n${sourceSiteLinkHtml(url)}\n🖼 og:image`,
-              parse_mode: "HTML"
-            }, thumbPath, thumbName);
-          }
-        }
-      }
-    }
-  } catch (err) {
-    console.error("[bot] og:image preview fetch failed:", err.message);
+  if (options.saveLinkPreviewImage) {
+    await saveLinkPreviewImageToTopic(token, chatId, { url, safeTopic, dir, scrape, segmentIndex });
   }
 
   // Generate the live screenshot immediately using default profile
-  const defaultProfile = defaultShotProfileForScrape(scrape?.id || currentSession.scrapeId);
+  const defaultProfile = defaultShotProfileForUrl(url, scrape?.id || currentSession.scrapeId);
   const tempPath = path.join(dir, `preview_init_${Date.now()}.png`);
   
   try {
@@ -1204,10 +1695,62 @@ async function startScreenshotPreview(token, chatId, scrape, segment, segmentInd
   }
 }
 
+async function startStandaloneScreenshotPreview(token, chatId, rawUrl, sourceMessageId = null, options = {}) {
+  const url = String(rawUrl || "").trim();
+  if (!url) return;
+  const topic = await resolveCurrentDownloadTopic();
+  const topicLabel = topic || "unsorted";
+  const { safeTopic, dir } = await botContext.ensureTopicDir(topic);
+  const statusMsg = await callApi(token, "sendMessage", {
+    chat_id: chatId,
+    text: `📸 <b>[Скриншот]</b> Анализирую страницу и генерирую предпросмотр...`,
+    parse_mode: "HTML",
+    disable_web_page_preview: true
+  });
+
+  if (options.saveLinkPreviewImage) {
+    await saveLinkPreviewImageToTopic(token, chatId, { url, safeTopic, dir });
+  }
+
+  const profile = defaultShotProfileForUrl(url, currentSession.scrapeId || "unsorted");
+  const tempPath = path.join(dir, `preview_init_${Date.now()}.png`);
+  try {
+    const buf = await captureScreenshot(url, profile);
+    await fs.writeFile(tempPath, buf);
+    await callApi(token, "deleteMessage", { chat_id: chatId, message_id: statusMsg.message_id }).catch(() => null);
+    const photoMsg = await callApiMultipart(token, "sendPhoto", {
+      chat_id: chatId,
+      caption: `📸 <b>Скриншот</b>\n${sourceSiteLinkHtml(url)}\n🖥 ${shotProfileLabel(profile)}\n📁 ${escapeHtml(topicLabel)}\n\nНастройте параметры и нажмите <b>+</b> для захвата.`,
+      parse_mode: "HTML",
+      reply_markup: buildShotKeyboard()
+    }, "photo", tempPath, "preview.png");
+    currentSession.shotCtx = {
+      url,
+      scrapeId: "",
+      segmentId: "",
+      topic: safeTopic,
+      standalone: true,
+      sourceMessageId,
+      profile,
+      messageId: photoMsg.message_id
+    };
+    await saveSession(botContext.DATA_DIR, currentSession);
+  } catch (err) {
+    await callApi(token, "deleteMessage", { chat_id: chatId, message_id: statusMsg.message_id }).catch(() => null);
+    await callApi(token, "sendMessage", {
+      chat_id: chatId,
+      text: `❌ Не удалось сгенерировать скриншот сайта: ${err.message}`,
+      parse_mode: "HTML"
+    });
+  } finally {
+    await fs.unlink(tempPath).catch(() => null);
+  }
+}
+
 async function saveQuickSegmentScreenshot(token, chatId, scrape, segment, segmentIndex, url) {
   const safeTopic = botContext.sanitizeMediaTopicName(segment.topic || "unsorted");
   const { dir } = await botContext.ensureTopicDir(safeTopic);
-  const profile = defaultShotProfileForScrape(scrape?.id || currentSession.scrapeId);
+  const profile = defaultShotProfileForUrl(url, scrape?.id || currentSession.scrapeId);
   const statusMsg = await callApi(token, "sendMessage", {
     chat_id: chatId,
     text: `📸 Делаю быстрый скриншот: <code>${escapeHtml(hostLabelForFileName(url))}</code>`,
@@ -1270,7 +1813,7 @@ async function saveQuickSegmentScreenshot(token, chatId, scrape, segment, segmen
   }
 }
 
-async function processDownload(token, chatId, scrape, segment, segmentIndex, url) {
+async function processDownload(token, chatId, scrape, segment, segmentIndex, url, sourceMessageId = null) {
   url = normalizeVkDownloadUrl(url);
 
   // Edit message to show downloading state
@@ -1367,19 +1910,19 @@ async function processDownload(token, chatId, scrape, segment, segmentIndex, url
         parse_mode: "HTML",
         reply_markup: renameButtonMarkup(renameId, timecodeRows)
       });
+      scheduleDeleteTelegramMessages(token, chatId, [sourceMessageId]);
 
     } else {
       throw new Error(job.error || "Не удалось загрузить медиа-файл");
     }
   } catch (error) {
     await stopProgress();
-    // If downloading failed, fall back to screenshotting!
     const fallbackMsg = await callApi(token, "sendMessage", {
       chat_id: chatId,
-      text: `⚠️ Не удалось скачать медиа (неподдерживаемый сайт). Запускаю скриншотер...`,
+      text: `⚠️ Не удалось скачать медиа. Сохраняю превью страницы...`,
       parse_mode: "HTML"
     }).catch(() => null);
-    await startScreenshotPreview(token, chatId, scrape, segment, segmentIndex, url);
+    await sendPagePreviewForSegment(token, chatId, scrape, segment, segmentIndex, url, sourceMessageId);
     if (fallbackMsg?.message_id) {
       await callApi(token, "deleteMessage", { chat_id: chatId, message_id: fallbackMsg.message_id }).catch(() => null);
     }
@@ -1388,12 +1931,17 @@ async function processDownload(token, chatId, scrape, segment, segmentIndex, url
 
 async function processUnsortedDownload(token, chatId, url, sourceMessageId = null) {
   const downloadUrl = normalizeVkDownloadUrl(url);
+  if (!isVkDownloadUrl(downloadUrl) && !isYtDlpCandidateUrl(downloadUrl)) {
+    await sendStandalonePagePreview(token, chatId, downloadUrl, sourceMessageId);
+    return;
+  }
+  const topic = await resolveCurrentDownloadTopic();
+  const topicLabel = topic || "unsorted";
   const statusMsg = await callApi(token, "sendMessage", {
     chat_id: chatId,
-    text: `${formatDownloadProgressLine({ stage: "standard", progress: 0 })}\nВ unsorted: <code>${escapeHtml(downloadUrl)}</code>`,
+    text: `${formatDownloadProgressLine({ stage: "standard", progress: 0 })}\nВ ${escapeHtml(topicLabel)}: <code>${escapeHtml(downloadUrl)}</code>`,
     parse_mode: "HTML"
   });
-  const topic = "unsorted";
   const job = {
     id: `bot_unsorted_${Date.now()}`,
     url: downloadUrl,
@@ -1410,7 +1958,7 @@ async function processUnsortedDownload(token, chatId, url, sourceMessageId = nul
 
   let mediaDownloaded = false;
   const stopProgress = startTelegramDownloadProgress(token, chatId, statusMsg.message_id, job, (currentJob) =>
-    `${formatDownloadProgressLine(currentJob)}\nВ unsorted: <code>${escapeHtml(downloadUrl)}</code>`
+    `${formatDownloadProgressLine(currentJob)}\nВ ${escapeHtml(topicLabel)}: <code>${escapeHtml(downloadUrl)}</code>`
   );
   try {
     await botContext.executeMediaDownload(job);
@@ -1419,9 +1967,10 @@ async function processUnsortedDownload(token, chatId, url, sourceMessageId = nul
       throw new Error(job.error || "Не удалось скачать");
     }
     mediaDownloaded = true;
-    const metadata = metadataFromDownloadJob(job);
+    const metadata = { ...metadataFromDownloadJob(job), folder: topicLabel };
     const entries = [];
-    for (const file of job.output_files) {
+    for (let index = 0; index < job.output_files.length; index += 1) {
+      const file = job.output_files[index];
       const absolutePath = file?.path ? path.join(botContext.PAMPAM_ROOT, file.path.replace(/\//g, path.sep)) : "";
       const stats = absolutePath ? await fs.stat(absolutePath).catch(() => null) : null;
       if (!absolutePath || !stats?.isFile?.()) continue;
@@ -1429,7 +1978,7 @@ async function processUnsortedDownload(token, chatId, url, sourceMessageId = nul
       entries.push({
         path: absolutePath,
         relPath: file.path,
-        name: safeSendFileNameFromMetadata(fileName, downloadUrl, metadata),
+        name: safeSendFileNameFromMetadata(fileName, downloadUrl, metadata, multiMediaFileSuffix(index, job.output_files.length)),
         originalName: fileName,
         size: stats.size
       });
@@ -1462,18 +2011,9 @@ async function processUnsortedDownload(token, chatId, url, sourceMessageId = nul
       if (chunk.length >= 2) {
         const sentMessages = await sendLocalMediaGroup(token, chatId, chunk, captionUsed ? "" : caption);
         const firstMessageId = Array.isArray(sentMessages) ? sentMessages[0]?.message_id : null;
-        if (!controlsAttached && firstMessageId) {
-          await callApi(token, "editMessageReplyMarkup", {
-            chat_id: chatId,
-            message_id: firstMessageId,
-            reply_markup: controlsMarkup
-          }).catch((error) => {
-            if (/message is not modified/i.test(String(error?.message || ""))) return true;
-            throw error;
-          });
-          attachRenameTargetMessage(renameId, chatId, firstMessageId);
+        if (!captionUsed && firstMessageId) {
+          attachRenameTargetAlbumMessage(renameId, chatId, firstMessageId);
           await saveSession(botContext.DATA_DIR, currentSession);
-          controlsAttached = true;
         }
         captionUsed = true;
       } else {
@@ -1493,8 +2033,21 @@ async function processUnsortedDownload(token, chatId, url, sourceMessageId = nul
       }
       captionUsed = true;
     }
+    if (entries.length > 1 && !controlsAttached && renameId) {
+      const controlMsg = await callApi(token, "sendMessage", {
+        chat_id: chatId,
+        text: `<b>Управление альбомом</b>\n${caption}`,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: controlsMarkup
+      });
+      if (controlMsg?.message_id) {
+        attachRenameTargetMessage(renameId, chatId, controlMsg.message_id);
+        await saveSession(botContext.DATA_DIR, currentSession);
+      }
+    }
 
-    scheduleDeleteTelegramMessages(token, chatId, [statusMsg.message_id]);
+    scheduleDeleteTelegramMessages(token, chatId, [statusMsg.message_id, sourceMessageId]);
   } catch (error) {
     await stopProgress();
     console.error(`[download-unsorted] failed for ${downloadUrl}: ${error?.message || error}`);
@@ -1509,32 +2062,29 @@ async function processUnsortedDownload(token, chatId, url, sourceMessageId = nul
       }).catch(() => null);
       return;
     }
-    try {
-      const { safeTopic, dir } = await botContext.ensureTopicDir("unsorted");
-      const profile = defaultShotProfileForScrape(currentSession.scrapeId || "unsorted");
-      const buf = await captureScreenshot(downloadUrl, profile);
-      const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
-      const shotName = await ensureUniqueFileNameInDir(dir, safeTelegramUploadFileName(`${hostLabelForFileName(downloadUrl)}_${stamp}.png`, "screenshot.png"));
-      const shotPath = path.join(dir, shotName);
-      await fs.writeFile(shotPath, buf);
-      const relPath = `${safeTopic}/${shotName}`;
-      const stats = await fs.stat(shotPath).catch(() => null);
-      const renameId = rememberRenameTarget(relPath);
-      if (renameId) await saveSession(botContext.DATA_DIR, currentSession);
-      await sendLocalMedia(token, {
-        chat_id: chatId,
-        caption: `📸 <b>Скриншот</b>\n${sourceSiteLinkHtml(downloadUrl)}\n🖥 ${shotProfileLabel(profile)}${stats ? `\n📦 ${escapeHtml(formatBytes(stats.size))}` : ""}`,
-        parse_mode: "HTML",
-        reply_markup: renameButtonMarkup(renameId)
-      }, shotPath, shotName);
-      scheduleDeleteTelegramMessages(token, chatId, [statusMsg.message_id]);
-    } catch (shotError) {
-      await callApi(token, "editMessageText", {
-        chat_id: chatId,
-        message_id: statusMsg.message_id,
-        text: `Не удалось скачать медиа или сделать скриншот: ${shotError.message}`
-      }).catch(() => null);
-    }
+    await callApi(token, "editMessageText", {
+      chat_id: chatId,
+      message_id: statusMsg.message_id,
+      text: `⚠️ Не удалось скачать медиа. Сохраняю превью страницы...`
+    }).catch(() => null);
+    await sendStandalonePagePreview(token, chatId, downloadUrl, sourceMessageId);
+    scheduleDeleteTelegramMessages(token, chatId, [statusMsg.message_id]);
+  }
+}
+
+const UNSORTED_DOWNLOAD_ITEM_TIMEOUT_MS = 12 * 60 * 1000;
+
+async function runWithTimeout(promise, timeoutMs, message) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -1554,7 +2104,19 @@ async function runUnsortedDownloadQueue(token, chatId) {
           parse_mode: "HTML",
           disable_web_page_preview: true
         }).catch(() => null);
-        await processUnsortedDownload(token, chatId, url, null);
+        await runWithTimeout(
+          processUnsortedDownload(token, chatId, url, batch.sourceMessageId),
+          UNSORTED_DOWNLOAD_ITEM_TIMEOUT_MS,
+          "Download task timed out"
+        ).catch(async (error) => {
+          console.error(`[download-queue] item failed: ${url}: ${error.message}`);
+          await callApi(token, "sendMessage", {
+            chat_id: chatId,
+            text: `Не удалось скачать за отведенное время, пропускаю и иду дальше:\n<code>${escapeHtml(url)}</code>`,
+            parse_mode: "HTML",
+            disable_web_page_preview: true
+          }).catch(() => null);
+        });
       }
       scheduleDeleteTelegramMessages(token, chatId, [batch.statusMessageId]);
     }
@@ -1625,25 +2187,23 @@ const REMOTION_FIELD_LABELS = {
   logo: "лого или источник"
 };
 
+function cleanRemotionDraftAssetInput(value) {
+  const raw = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!raw) return "";
+  if (/^(?:без файла|нет|none|null|no|empty|пусто|очистить)$/i.test(raw)) return "";
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (/[\\/]/.test(raw) || /\.[a-z0-9]{2,5}(?:[?#].*)?$/i.test(raw)) return raw;
+  return "";
+}
+
 function defaultRemotionDraft(text = "") {
   const defaults = currentSession?.remotionDefaults || {};
-  const quote = String(text || "").trim();
+  const parsed = parseRemotionMessage(text, defaults);
   return {
-    format: "quote-1x1",
+    format: parsed.format,
     props: {
-      type: "quote",
-      layout: "Left",
-      source: String(defaults.source || "UContent").trim(),
-      quote,
-      title: quote,
-      author: "",
-      role: "",
-      date: "",
-      meta: "",
-      logoIcon: String(defaults.logoIcon || "").trim(),
-      accent: "#f0b24c",
-      textScale: 1,
-      background: { dim: 0.7 }
+      ...parsed.props,
+      layout: parsed.props.layout || "Left"
     },
     logoChoices: []
   };
@@ -1672,7 +2232,10 @@ function parseRemotionMessage(text, defaults = {}) {
     ["лого", "logoIcon"], ["логотип", "logoIcon"], ["logo", "logoIcon"], ["logoicon", "logoIcon"],
     ["издание", "source"], ["источник", "source"], ["source", "source"],
     ["фон", "background"], ["background", "background"], ["bg", "background"],
-    ["формат", "format"], ["format", "format"]
+    ["формат", "format"], ["format", "format"],
+    ["дата", "date"], ["date", "date"], ["meta", "date"],
+    ["выравнивание", "layout"], ["layout", "layout"], ["align", "layout"],
+    ["шрифт", "textScale"], ["font", "textScale"], ["scale", "textScale"], ["textscale", "textScale"]
   ]);
 
   for (const line of lines) {
@@ -1691,20 +2254,51 @@ function parseRemotionMessage(text, defaults = {}) {
   const hasKnownFields = Object.keys(fields).length > 0;
   const quote = hasKnownFields ? String(fields.quote || "").trim() : String(text || "").trim();
   const format = REMOTION_FORMATS.has(String(fields.format || "").trim()) ? String(fields.format).trim() : "quote-1x1";
+  
+  const logoIcon = String(fields.logoIcon || defaults.logoIcon || "").trim();
+  const cleanLogoIcon = (logoIcon.toLowerCase() === "текстом" || logoIcon.toLowerCase() === "текст") ? "" : logoIcon;
+  const backgroundInput = cleanRemotionDraftAssetInput(fields.background);
+
+  let textScale = 1;
+  const scaleStr = String(fields.textScale || "").trim();
+  if (scaleStr) {
+    const num = parseFloat(scaleStr);
+    if (Number.isFinite(num)) {
+      textScale = scaleStr.includes("%") ? num / 100 : num;
+    }
+  }
+
+  let lineHeightScale = 1;
+  const lineScaleStr = String(fields.lineHeightScale || "").trim();
+  if (lineScaleStr) {
+    const num = parseFloat(lineScaleStr);
+    if (Number.isFinite(num)) {
+      lineHeightScale = lineScaleStr.includes("%") ? num / 100 : num;
+    }
+  }
+
+  const layout = String(fields.layout || "").trim();
+  const dateVal = String(fields.date || "").trim();
+
   return {
     format,
     props: {
       type: format.startsWith("news-") ? "news" : "quote",
-      source: String(fields.source || defaults.source || "UContent").trim(),
+      source: String(fields.source || defaults.source || "").trim(),
       quote,
       title: quote,
       author: String(fields.author || "").trim(),
       role: String(fields.role || "").trim(),
-      logoIcon: String(fields.logoIcon || defaults.logoIcon || "").trim(),
+      logoIcon: cleanLogoIcon,
       accent: "#f0b24c",
-      background: String(fields.background || "").trim()
-        ? { image: String(fields.background).trim(), dim: 0.62, blur: 0 }
-        : { dim: 0.7 }
+      background: backgroundInput
+        ? { image: backgroundInput, dim: 0.62, blur: 0 }
+        : { dim: 0.7 },
+      textScale,
+      lineHeightScale,
+      layout,
+      date: dateVal,
+      meta: dateVal
     }
   };
 }
@@ -1723,9 +2317,28 @@ function rememberRemotionRender(body) {
   return id;
 }
 
+function remotionFontPercent(props = {}) {
+  return Math.round((Number(props.textScale || 1) || 1) * 100);
+}
+
+function remotionLinePercent(props = {}) {
+  return Math.round((Number(props.lineHeightScale || 1) || 1) * 100);
+}
+
+function appendRemotionCaptionLine(caption, line) {
+  const suffix = `\n${line}`;
+  if (String(caption || "").length + suffix.length <= TELEGRAM_CAPTION_MAX) return `${caption}${suffix}`;
+  const room = Math.max(0, TELEGRAM_CAPTION_MAX - suffix.length - 3);
+  return `${String(caption || "").slice(0, room).trimEnd()}...${suffix}`;
+}
+
 function remotionResultMarkup(renameId, renderId) {
   const base = renameButtonMarkup(renameId);
   const rows = Array.isArray(base.inline_keyboard) ? [...base.inline_keyboard] : [];
+  rows.unshift([
+    { text: "L-", callback_data: `sdvg:remotion:line:${renderId}:-` },
+    { text: "L+", callback_data: `sdvg:remotion:line:${renderId}:+` }
+  ]);
   rows.unshift([
     { text: "A-", callback_data: `sdvg:remotion:font:${renderId}:-` },
     { text: "A+", callback_data: `sdvg:remotion:font:${renderId}:+` }
@@ -1757,9 +2370,13 @@ async function renderTelegramRemotionBody(token, chatId, body) {
         format_note: body.format
       }
     });
+    const captionWithFont = appendRemotionCaptionLine(
+      appendRemotionCaptionLine(caption, `Шрифт: ${remotionFontPercent(body.props || {})}%`),
+      `Строки: ${remotionLinePercent(body.props || {})}%`
+    );
     const sentMessage = await sendLocalMedia(token, {
       chat_id: chatId,
-      caption,
+      caption: captionWithFont,
       parse_mode: "HTML",
       reply_markup: remotionResultMarkup(renameId, renderId)
     }, filePath, safeTelegramUploadFileName(result.file.name || path.basename(filePath), "remotion.mp4"));
@@ -1769,10 +2386,12 @@ async function renderTelegramRemotionBody(token, chatId, body) {
     await callApi(token, "deleteMessage", { chat_id: chatId, message_id: statusMsg.message_id }).catch(() => null);
     return result;
   } catch (error) {
+    console.error("[bot-render-error] Remotion render failed:", error);
+    const shortMsg = String(error?.message || error).slice(0, 1000);
     await callApi(token, "editMessageText", {
       chat_id: chatId,
       message_id: statusMsg.message_id,
-      text: `Не удалось сгенерировать Remotion: ${error.message}`
+      text: `Не удалось сгенерировать Remotion: ${shortMsg}`
     }).catch(() => null);
     throw error;
   }
@@ -1849,7 +2468,8 @@ function remotionDraftSummary(draft) {
     `<b>Фон:</b> ${background ? `<code>${escapeHtml(background)}</code>` : "<i>без файла</i>"}`,
     `<b>Формат:</b> <code>${escapeHtml(draft.format || "quote-1x1")}</code>`,
     `<b>Выравнивание:</b> <code>${escapeHtml(props.layout || "Left")}</code>`,
-    `<b>Шрифт:</b> ${Math.round((Number(props.textScale || 1) || 1) * 100)}%`
+    `<b>Шрифт:</b> ${Math.round((Number(props.textScale || 1) || 1) * 100)}%`,
+    `<b>Строки:</b> ${remotionLinePercent(props)}%`
   ].join("\n");
 }
 
@@ -1877,8 +2497,14 @@ function remotionOutputLabel(output) {
 function remotionPanelMarkup(draft) {
   const format = String(draft?.format || "quote-1x1");
   const layout = String(draft?.props?.layout || "Left");
+  const fontPercent = remotionFontPercent(draft?.props || {});
+  const linePercent = remotionLinePercent(draft?.props || {});
   const parts = remotionFormatParts(format);
   const rows = [
+    [
+      { text: `${parts.type === "quote" ? "✓ " : ""}Цитата + автор`, callback_data: "sdvg:remotion:type:quote" },
+      { text: `${parts.type === "news" ? "✓ " : ""}Заголовок + дата`, callback_data: "sdvg:remotion:type:news" }
+    ],
     [
       { text: "Цитата", callback_data: "sdvg:remotion:field:quote" },
       { text: "Автор", callback_data: "sdvg:remotion:field:author" }
@@ -1890,12 +2516,22 @@ function remotionPanelMarkup(draft) {
     [
       { text: `${parts.shape === "1x1" ? "✓ " : ""}1:1`, callback_data: "sdvg:remotion:shape:1x1" },
       { text: `${parts.shape === "2x1" ? "✓ " : ""}2:1`, callback_data: "sdvg:remotion:shape:2x1" },
-      { text: `Выравн.: ${layout}`, callback_data: "sdvg:remotion:cycle:layout" }
+      { text: layout, callback_data: "sdvg:remotion:cycle:layout" }
     ],
     [
       { text: `${parts.output === "mp4" ? "✓ " : ""}MP4`, callback_data: "sdvg:remotion:output:mp4" },
       { text: `${parts.output === "alpha" ? "✓ " : ""}WebM α`, callback_data: "sdvg:remotion:output:alpha" },
       { text: `${parts.output === "alpha-mov" ? "✓ " : ""}ProRes α`, callback_data: "sdvg:remotion:output:alpha-mov" }
+    ],
+    [
+      { text: "A-", callback_data: "sdvg:remotion:draftfont:-" },
+      { text: `Шрифт: ${fontPercent}%`, callback_data: "sdvg:remotion:noop" },
+      { text: "A+", callback_data: "sdvg:remotion:draftfont:+" }
+    ],
+    [
+      { text: "L-", callback_data: "sdvg:remotion:draftline:-" },
+      { text: `Строки: ${linePercent}%`, callback_data: "sdvg:remotion:noop" },
+      { text: "L+", callback_data: "sdvg:remotion:draftline:+" }
     ],
     [
       { text: "Лого / источник", callback_data: "sdvg:remotion:field:logo" },
@@ -2010,8 +2646,15 @@ function figmaThemeRows(scrape) {
   }));
 }
 
-async function sendActiveScrapeFigmaThemes(token, chatId, minimal = false) {
-  if (!currentSession.scrapeId) {
+function currentFigmaScrapeId(explicitScrapeId = "") {
+  const requested = String(explicitScrapeId || "").trim();
+  if (requested) return requested;
+  return currentSession.sdvgActive && currentSession.scrapeId ? currentSession.scrapeId : "";
+}
+
+async function sendActiveScrapeFigmaThemes(token, chatId, minimal = false, explicitScrapeId = "") {
+  const scrapeId = currentFigmaScrapeId(explicitScrapeId);
+  if (!scrapeId && !currentSession.scrapeId) {
     await callApi(token, "sendMessage", {
       chat_id: chatId,
       text: "Нет активного сценария. Сначала откройте /sdvg или нажмите TG в веб-интерфейсе."
@@ -2019,7 +2662,7 @@ async function sendActiveScrapeFigmaThemes(token, chatId, minimal = false) {
     return;
   }
   try {
-    const scrape = await botContext.readScrape(currentSession.scrapeId);
+    const scrape = await botContext.readScrape(scrapeId);
     const rows = figmaThemeRows(scrape);
     if (!rows.length) {
       await callApi(token, "sendMessage", { chat_id: chatId, text: "Темы не найдены." });
@@ -2141,36 +2784,62 @@ function buildSearchResultsMarkup(items) {
   return { inline_keyboard: rows };
 }
 
-async function runTelegramSegmentSearch(token, chatId, scrape, segment) {
-  const query = searchQueryFromSegment(segment);
-  if (!query) {
-    await callApi(token, "sendMessage", { chat_id: chatId, text: "Не из чего искать: сегмент пустой." });
+async function fetchRssSearchItems(query, scrape = null, { limit = 6 } = {}) {
+  const response = await fetch(`${UCONTENT_SELF_URL}/api/rss-search`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ query, hours: 504, limit: Math.max(limit, 6), searxng: true })
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+  const existing = new Set(String(scrape?.content || "").split(/\r?\n/).map(normalizeSearchUrl));
+  return (Array.isArray(data.items) ? data.items : [])
+    .filter((item) => item?.url && !existing.has(normalizeSearchUrl(item.url)))
+    .slice(0, limit);
+}
+
+async function refreshSearchResultsMessage(token, chatId, messageId, ctx) {
+  if (!ctx?.items?.length) {
+    currentSession.searchCtx = null;
+    await saveSession(botContext.DATA_DIR, currentSession);
+    await callApi(token, "deleteMessage", { chat_id: chatId, message_id: messageId }).catch(() => null);
+    return;
+  }
+  await callApi(token, "editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text: buildSearchResultsText(ctx.query, ctx.items),
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: buildSearchResultsMarkup(ctx.items)
+  }).catch(() => null);
+}
+
+async function runTelegramSearch(token, chatId, query, { scrape = null, segment = null } = {}) {
+  const cleanQuery = String(query || "").trim();
+  if (!cleanQuery) {
+    await callApi(token, "sendMessage", { chat_id: chatId, text: "Не из чего искать: запрос пустой." });
     return;
   }
   const statusMsg = await callApi(token, "sendMessage", {
     chat_id: chatId,
-    text: `\uD83D\uDD0E Ищу: <code>${escapeHtml(query)}</code>`,
+    text: `\uD83D\uDD0E Ищу: <code>${escapeHtml(cleanQuery)}</code>`,
     parse_mode: "HTML"
   });
   try {
-    const response = await fetch(`${UCONTENT_SELF_URL}/api/rss-search`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ query, hours: 504, limit: 6, searxng: true })
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-    const existing = new Set(String(scrape.content || "").split(/\r?\n/).map(normalizeSearchUrl));
-    const items = (Array.isArray(data.items) ? data.items : [])
-      .filter((item) => item?.url && !existing.has(normalizeSearchUrl(item.url)))
-      .slice(0, 6);
-    currentSession.searchCtx = { scrapeId: scrape.id, segmentId: segment.id, query, items };
+    const items = await fetchRssSearchItems(cleanQuery, scrape, { limit: 6 });
+    currentSession.searchCtx = {
+      scrapeId: scrape?.id || "",
+      segmentId: segment?.id || "",
+      query: cleanQuery,
+      items
+    };
     await saveSession(botContext.DATA_DIR, currentSession);
     if (!items.length) {
       await callApi(token, "editMessageText", {
         chat_id: chatId,
         message_id: statusMsg.message_id,
-        text: `\uD83D\uDD0E Ничего не найдено: <code>${escapeHtml(query)}</code>`,
+        text: `\uD83D\uDD0E Ничего не найдено: <code>${escapeHtml(cleanQuery)}</code>`,
         parse_mode: "HTML"
       }).catch(() => null);
       return;
@@ -2178,7 +2847,7 @@ async function runTelegramSegmentSearch(token, chatId, scrape, segment) {
     await callApi(token, "editMessageText", {
       chat_id: chatId,
       message_id: statusMsg.message_id,
-      text: buildSearchResultsText(query, items),
+      text: buildSearchResultsText(cleanQuery, items),
       parse_mode: "HTML",
       disable_web_page_preview: true,
       reply_markup: buildSearchResultsMarkup(items)
@@ -2193,6 +2862,11 @@ async function runTelegramSegmentSearch(token, chatId, scrape, segment) {
   }
 }
 
+async function runTelegramSegmentSearch(token, chatId, scrape, segment) {
+  const query = searchQueryFromSegment(segment);
+  await runTelegramSearch(token, chatId, query, { scrape, segment });
+}
+
 async function addSearchResultToScrape(token, chatId, resultIndex, resultsMessageId) {
   const ctx = currentSession.searchCtx;
   const item = ctx?.items?.[resultIndex];
@@ -2200,6 +2874,15 @@ async function addSearchResultToScrape(token, chatId, resultIndex, resultsMessag
     await callApi(token, "sendMessage", { chat_id: chatId, text: "Результат поиска устарел." });
     return;
   }
+  if (!ctx.segmentId) {
+    ctx.items = ctx.items.filter((_, index) => index !== resultIndex);
+    currentSession.searchCtx = ctx.items.length ? ctx : null;
+    await saveSession(botContext.DATA_DIR, currentSession);
+    await refreshSearchResultsMessage(token, chatId, resultsMessageId, ctx);
+    await enqueueUnsortedDownloads(token, chatId, [item.url], null);
+    return;
+  }
+
   const scrape = await botContext.readScrape(ctx.scrapeId);
   const segments = Array.isArray(scrape.segments) ? scrape.segments : [];
   const segmentIndex = segments.findIndex((segment) => segment.id === ctx.segmentId);
@@ -2219,46 +2902,358 @@ async function addSearchResultToScrape(token, chatId, resultIndex, resultsMessag
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ content: lines.join("\n") })
     });
+    const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      throw new Error(errorData.error || `HTTP ${response.status}`);
+      throw new Error(data.error || `HTTP ${response.status}`);
     }
+    if (data.scrape) Object.assign(scrape, data.scrape);
   }
   ctx.items = ctx.items.filter((_, index) => index !== resultIndex);
   currentSession.searchCtx = ctx.items.length ? ctx : null;
   await saveSession(botContext.DATA_DIR, currentSession);
-  if (!ctx.items.length) {
-    await callApi(token, "deleteMessage", { chat_id: chatId, message_id: resultsMessageId }).catch(() => null);
-    return;
+  await refreshSearchResultsMessage(token, chatId, resultsMessageId, ctx);
+
+  const freshSegments = Array.isArray(scrape.segments) ? scrape.segments : [];
+  const freshSegmentIndex = freshSegments.findIndex((segment) => segment.id === ctx.segmentId);
+  if (freshSegmentIndex < 0) return;
+  const freshSegment = freshSegments[freshSegmentIndex];
+  const downloadUrl = normalizeVkDownloadUrl(item.url);
+  if (isVkDownloadUrl(downloadUrl) || isYtDlpCandidateUrl(downloadUrl)) {
+    await processDownload(token, chatId, scrape, freshSegment, freshSegmentIndex, downloadUrl, null);
+  } else {
+    await sendPagePreviewForSegment(token, chatId, scrape, freshSegment, freshSegmentIndex, item.url, null);
   }
-  await callApi(token, "editMessageText", {
-    chat_id: chatId,
-    message_id: resultsMessageId,
-    text: buildSearchResultsText(ctx.query, ctx.items),
-    parse_mode: "HTML",
-    disable_web_page_preview: true,
-    reply_markup: buildSearchResultsMarkup(ctx.items)
-  }).catch(() => null);
 }
 
 async function dropSearchResult(token, chatId, resultIndex, resultsMessageId) {
   const ctx = currentSession.searchCtx;
   if (!ctx?.items?.length) return;
-  ctx.items = ctx.items.filter((_, index) => index !== resultIndex);
+  const dropped = ctx.items[resultIndex];
+  if (dropped?.url) {
+    await fetch(`${UCONTENT_SELF_URL}/api/rss-candidates/reject`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ topic: ctx.query, url: dropped.url })
+    }).catch(() => null);
+  }
+  const scrape = ctx.scrapeId ? await botContext.readScrape(ctx.scrapeId).catch(() => null) : null;
+  ctx.items = await fetchRssSearchItems(ctx.query, scrape, { limit: 6 }).catch(() =>
+    ctx.items.filter((_, index) => index !== resultIndex)
+  );
   currentSession.searchCtx = ctx.items.length ? ctx : null;
   await saveSession(botContext.DATA_DIR, currentSession);
-  if (!ctx.items.length) {
-    await callApi(token, "deleteMessage", { chat_id: chatId, message_id: resultsMessageId }).catch(() => null);
+  await refreshSearchResultsMessage(token, chatId, resultsMessageId, ctx);
+}
+
+function topicMediaStats(scrape) {
+  const byTopic = new Map();
+  for (const segment of scrape?.segments || []) {
+    const topic = cleanupCaptionText(segment?.topic || "") || "unsorted";
+    const current = byTopic.get(topic) || { topic, segments: 0, media: 0, links: 0, done: 0 };
+    current.segments += 1;
+    if (segment?.is_done) current.done += 1;
+    current.media += Array.isArray(segment?.media_items) ? segment.media_items.length : 0;
+    if (extractFirstUrl(segment?.text || "")) current.links += 1;
+    byTopic.set(topic, current);
+  }
+  return byTopic;
+}
+
+function searchableMaterialTopics(scrape) {
+  const stats = topicMediaStats(scrape);
+  const topics = figmaThemeRows(scrape)
+    .map((row) => cleanupCaptionText(row.topic))
+    .filter(Boolean)
+    .filter((topic) => !/^(intro|интро|outro|аутро|конец|финал)$/i.test(topic));
+  const seen = new Set();
+  return topics.map((topic, order) => {
+    const key = topic.toLowerCase().replace(/ё/g, "е");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    const row = stats.get(topic);
+    const media = Number(row?.media || 0);
+    const links = Number(row?.links || 0);
+    return {
+      topic,
+      query: topic,
+      media,
+      links,
+      contentCount: media + links,
+      order
+    };
+  }).filter(Boolean).sort((a, b) =>
+    Number(a.contentCount || 0) - Number(b.contentCount || 0) ||
+    Number(a.media || 0) - Number(b.media || 0) ||
+    Number(a.order || 0) - Number(b.order || 0)
+  );
+}
+
+function findTopicHeadingInsertIndex(content, topic) {
+  const lines = String(content || "").split(/\r?\n/);
+  const normalizedTopic = cleanupCaptionText(topic).toLowerCase().replace(/ё/g, "е");
+  const headingIndex = lines.findIndex((line) => {
+    const match = String(line || "").match(/^###\s+(.+?)\s*$/);
+    return match && cleanupCaptionText(match[1]).toLowerCase().replace(/ё/g, "е") === normalizedTopic;
+  });
+  return headingIndex >= 0 ? headingIndex + 1 : lines.length;
+}
+
+async function insertSearchItemIntoTopic(scrape, topic, item) {
+  const url = String(item?.url || "").trim();
+  if (!url) throw new Error("У результата нет URL");
+  const existing = new Set(String(scrape.content || "").split(/\r?\n/).map(normalizeSearchUrl));
+  if (!existing.has(normalizeSearchUrl(url))) {
+    const lines = String(scrape.content || "").split(/\r?\n/);
+    const insertAt = findTopicHeadingInsertIndex(scrape.content || "", topic);
+    lines.splice(insertAt, 0, "", url, "");
+    const response = await fetch(`${UCONTENT_SELF_URL}/api/scrapes/${encodeURIComponent(scrape.id)}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content: lines.join("\n") })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    scrape = data.scrape || scrape;
+  }
+  const segmentIndex = (scrape.segments || []).findIndex((segment) =>
+    normalizeSearchUrl(extractFirstUrl(segment?.text || "")) === normalizeSearchUrl(url)
+  );
+  return { scrape, segmentIndex, segment: segmentIndex >= 0 ? scrape.segments[segmentIndex] : null };
+}
+
+function findMissingText(ctx) {
+  const topics = Array.isArray(ctx?.topics) ? ctx.topics : [];
+  const current = topics[Math.max(0, Math.min(Number(ctx?.topicIndex || 0), topics.length - 1))];
+  if (!current) {
+    return "\uD83D\uDD0E <b>Find Missing</b>\nТем сценария не найдено.";
+  }
+  const items = Array.isArray(current.items) ? current.items : [];
+  const rows = items.map((item, index) => {
+    const url = String(item?.url || "").trim();
+    const title = cleanupCaptionText(item?.title || item?.url || "link");
+    const source = cleanupCaptionText(item?.source || item?.origin || extractHostLabel(url) || "RSS");
+    const label = `${escapeHtml(source)}: ${escapeHtml(clipLabel(title, 180))}`;
+    return url ? `<b>${index + 1}.</b> <a href="${escapeHtml(url)}">${label}</a>` : `<b>${index + 1}.</b> ${label}`;
+  });
+  const empty = items.length ? [] : ["", "Кандидатов для этой темы пока нет."];
+  return [
+    "\uD83D\uDD0E <b>Find Missing</b>",
+    `<b>${escapeHtml(ctx.scrapeTitle || ctx.scrapeId || "scenario")}</b>`,
+    "",
+    `${Number(ctx.topicIndex || 0) + 1}/${topics.length}: <b>${escapeHtml(current.topic)}</b>`,
+    `Контент: ${Number(current.contentCount || 0)} (${Number(current.media || 0)} медиа, ${Number(current.links || 0)} ссылок)`,
+    `Запрос: <code>${escapeHtml(current.query || current.topic)}</code>`,
+    ...empty,
+    ...(items.length ? ["", ...rows] : [])
+  ].join("\n");
+}
+
+function findMissingMarkup(ctx) {
+  const topics = Array.isArray(ctx?.topics) ? ctx.topics : [];
+  const topicIndex = Math.max(0, Math.min(Number(ctx?.topicIndex || 0), topics.length - 1));
+  const current = topics[topicIndex] || {};
+  const items = Array.isArray(current.items) ? current.items : [];
+  const rows = items.map((_, index) => [
+    { text: `+${index + 1}`, callback_data: `sdvg:missing:add:${index}` },
+    { text: `-${index + 1}`, callback_data: `sdvg:missing:drop:${index}` }
+  ]);
+  if (topics.length > 1) {
+    rows.push([
+      { text: "<", callback_data: `sdvg:missing:topic:${Math.max(0, topicIndex - 1)}` },
+      { text: `${topicIndex + 1}/${topics.length}`, callback_data: "sdvg:missing:noop" },
+      { text: ">", callback_data: `sdvg:missing:topic:${Math.min(topics.length - 1, topicIndex + 1)}` }
+    ]);
+  }
+  rows.push([
+    { text: "\u270F\uFE0F Запрос", callback_data: "sdvg:missing:query" },
+    { text: "\uD83D\uDD04", callback_data: "sdvg:missing:refresh" },
+    { text: "\u2715", callback_data: "sdvg:missing:close" }
+  ]);
+  return { inline_keyboard: rows };
+}
+
+async function editFindMissingMessage(token, chatId, messageId, ctx) {
+  if (!ctx?.topics?.length) {
+    currentSession.findMissingCtx = null;
+    await saveSession(botContext.DATA_DIR, currentSession);
+    await callApi(token, "editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      text: "\uD83D\uDD0E Find Missing: тем сценария не найдено."
+    }).catch(() => null);
     return;
   }
   await callApi(token, "editMessageText", {
     chat_id: chatId,
-    message_id: resultsMessageId,
-    text: buildSearchResultsText(ctx.query, ctx.items),
+    message_id: messageId,
+    text: findMissingText(ctx),
     parse_mode: "HTML",
     disable_web_page_preview: true,
-    reply_markup: buildSearchResultsMarkup(ctx.items)
+    reply_markup: findMissingMarkup(ctx)
   }).catch(() => null);
+}
+
+async function buildFindMissingCtx(scrape) {
+  const materialTopics = searchableMaterialTopics(scrape);
+  if (!materialTopics.length) {
+    return { scrapeId: scrape.id, scrapeTitle: scrape.title || scrape.id, topics: [], topicIndex: 0 };
+  }
+  const topics = [];
+  const concurrency = 3;
+  let cursor = 0;
+  async function worker() {
+    while (cursor < materialTopics.length) {
+      const index = cursor;
+      cursor += 1;
+      const topicInfo = materialTopics[index];
+      const query = topicInfo.query || topicInfo.topic;
+      const items = await fetchRssSearchItems(query, scrape, { limit: 6 }).catch(() => []);
+      topics[index] = { ...topicInfo, query, items };
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, materialTopics.length) }, () => worker()));
+  return {
+    scrapeId: scrape.id,
+    scrapeTitle: scrape.title || scrape.id,
+    topics: topics.filter(Boolean),
+    topicIndex: 0,
+    createdAt: new Date().toISOString()
+  };
+}
+
+async function sendFindMissing(token, chatId, explicitScrapeId = "") {
+  const statusMsg = await callApi(token, "sendMessage", {
+    chat_id: chatId,
+    text: "\uD83D\uDD0E Сортирую темы по количеству контента и ищу ссылки в UTrends..."
+  });
+  try {
+    const scrapeId = String(explicitScrapeId || currentSession.scrapeId || "").trim();
+    const scrape = await botContext.readScrape(scrapeId);
+    const ctx = await buildFindMissingCtx(scrape);
+    currentSession.findMissingCtx = ctx;
+    await saveSession(botContext.DATA_DIR, currentSession);
+    await callApi(token, "editMessageText", {
+      chat_id: chatId,
+      message_id: statusMsg.message_id,
+      text: findMissingText(ctx),
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: ctx.topics.length ? findMissingMarkup(ctx) : undefined
+    }).catch(() => null);
+  } catch (error) {
+    await callApi(token, "editMessageText", {
+      chat_id: chatId,
+      message_id: statusMsg.message_id,
+      text: `Find Missing не сработал: ${error.message}`
+    }).catch(() => null);
+  }
+}
+
+async function refreshFindMissingTopic(ctx, topicIndex) {
+  const topic = ctx?.topics?.[topicIndex]?.topic || "";
+  if (!topic) return ctx;
+  const scrape = await botContext.readScrape(ctx.scrapeId);
+  const current = ctx.topics[topicIndex] || {};
+  const query = cleanupCaptionText(current.query || topic) || topic;
+  const items = await fetchRssSearchItems(query, scrape, { limit: 6 });
+  ctx.topics[topicIndex] = { ...current, topic, query, items };
+  return ctx;
+}
+
+async function handleFindMissingCallback(token, chatId, data, callbackMessageId, callbackId) {
+  const ctx = currentSession.findMissingCtx;
+  if (!ctx?.topics?.length) {
+    await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId, text: "Find Missing устарел.", show_alert: true }).catch(() => null);
+    return;
+  }
+  const action = data.slice("sdvg:missing:".length);
+  let topicIndex = Math.max(0, Math.min(Number(ctx.topicIndex || 0), ctx.topics.length - 1));
+
+  if (action === "noop") return;
+  if (action === "close") {
+    currentSession.findMissingCtx = null;
+    await saveSession(botContext.DATA_DIR, currentSession);
+    await callApi(token, "deleteMessage", { chat_id: chatId, message_id: callbackMessageId }).catch(() => null);
+    return;
+  }
+  if (action.startsWith("topic:")) {
+    ctx.topicIndex = Math.max(0, Math.min(Number(action.slice("topic:".length)) || 0, ctx.topics.length - 1));
+    currentSession.findMissingCtx = ctx;
+    await saveSession(botContext.DATA_DIR, currentSession);
+    await editFindMissingMessage(token, chatId, callbackMessageId, ctx);
+    return;
+  }
+  if (action === "query") {
+    const current = ctx.topics[topicIndex] || {};
+    const prompt = await callApi(token, "sendMessage", {
+      chat_id: chatId,
+      text: [
+        `Введите новый поисковый запрос для темы <b>${escapeHtml(current.topic || "")}</b>.`,
+        `Сейчас: <code>${escapeHtml(current.query || current.topic || "")}</code>`,
+        "",
+        "Можно написать <code>отмена</code>."
+      ].join("\n"),
+      parse_mode: "HTML"
+    }).catch(() => null);
+    currentSession.findMissingQueryCtx = {
+      messageId: callbackMessageId,
+      topicIndex,
+      promptMessageId: prompt?.message_id || null
+    };
+    await saveSession(botContext.DATA_DIR, currentSession);
+    return;
+  }
+  if (action === "refresh") {
+    await refreshFindMissingTopic(ctx, topicIndex).catch(() => null);
+    currentSession.findMissingCtx = ctx;
+    await saveSession(botContext.DATA_DIR, currentSession);
+    await editFindMissingMessage(token, chatId, callbackMessageId, ctx);
+    return;
+  }
+
+  const current = ctx.topics[topicIndex];
+  const resultIndex = Number(action.split(":")[1] || "-1");
+  const item = current?.items?.[resultIndex];
+  if (!item?.url) {
+    await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId, text: "Результат устарел.", show_alert: true }).catch(() => null);
+    return;
+  }
+
+  if (action.startsWith("drop:")) {
+    await fetch(`${UCONTENT_SELF_URL}/api/rss-candidates/reject`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ topic: current.topic, url: item.url })
+    }).catch(() => null);
+    await refreshFindMissingTopic(ctx, topicIndex).catch(() => {
+      current.items = current.items.filter((_, index) => index !== resultIndex);
+    });
+    currentSession.findMissingCtx = ctx;
+    await saveSession(botContext.DATA_DIR, currentSession);
+    await editFindMissingMessage(token, chatId, callbackMessageId, ctx);
+    return;
+  }
+
+  if (action.startsWith("add:")) {
+    await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId, text: "Добавляю и обрабатываю ссылку..." }).catch(() => null);
+    let scrape = await botContext.readScrape(ctx.scrapeId);
+    const inserted = await insertSearchItemIntoTopic(scrape, current.topic, item);
+    scrape = inserted.scrape;
+    const nextCtx = await buildFindMissingCtx(scrape);
+    const nextIndex = (nextCtx.topics || []).findIndex((entry) => entry.topic === current.topic);
+    nextCtx.topicIndex = nextIndex >= 0 ? nextIndex : Math.min(topicIndex, Math.max(0, nextCtx.topics.length - 1));
+    currentSession.findMissingCtx = nextCtx.topics.length ? nextCtx : null;
+    await saveSession(botContext.DATA_DIR, currentSession);
+    await editFindMissingMessage(token, chatId, callbackMessageId, nextCtx);
+    if (inserted.segment && inserted.segmentIndex >= 0) {
+      const downloadUrl = normalizeVkDownloadUrl(item.url);
+      if (isVkDownloadUrl(downloadUrl) || isYtDlpCandidateUrl(downloadUrl)) {
+        await processDownload(token, chatId, scrape, inserted.segment, inserted.segmentIndex, downloadUrl, null);
+      } else {
+        await sendPagePreviewForSegment(token, chatId, scrape, inserted.segment, inserted.segmentIndex, item.url, null);
+      }
+    }
+  }
 }
 
 function mediaPickerFilesForTopic(files, topic) {
@@ -2269,6 +3264,37 @@ function mediaPickerFilesForTopic(files, topic) {
     if (aTopic !== bTopic) return aTopic - bTopic;
     return String(b.updated_at ?? "").localeCompare(String(a.updated_at ?? ""));
   });
+}
+
+function filterMediaPickerFiles(files, query = "") {
+  const normalizedQuery = String(query || "").trim().toLowerCase();
+  if (!normalizedQuery) return files;
+  const tokens = normalizedQuery.split(/\s+/).filter(Boolean);
+  return files.filter((file) => {
+    const haystack = [
+      file.path,
+      file.name,
+      file.title,
+      file.description,
+      file.source_url,
+      file.topic
+    ].map((value) => String(value || "").toLowerCase()).join(" ");
+    return tokens.every((token) => haystack.includes(token));
+  });
+}
+
+function mediaPickerText(ctx) {
+  const topic = escapeHtml(ctx?.topic || "unsorted");
+  const query = String(ctx?.query || "").trim();
+  const count = Array.isArray(ctx?.files) ? ctx.files.length : 0;
+  const total = Array.isArray(ctx?.allFiles) ? ctx.allFiles.length : count;
+  if (!count) {
+    return query
+      ? `Files for <code>${topic}</code>\nNo media files found for <b>${escapeHtml(query)}</b>.`
+      : "No media files found.";
+  }
+  const suffix = query ? `\nSearch: <b>${escapeHtml(query)}</b> (${count}/${total})` : "";
+  return `Files for <code>${topic}</code>\nPick a file to attach. Then you can set its timecode.${suffix}`;
 }
 
 function buildMediaPickerMarkup(ctx, page = 0) {
@@ -2290,28 +3316,51 @@ function buildMediaPickerMarkup(ctx, page = 0) {
       { text: ">", callback_data: `sdvg:media:page:${Math.min(pages - 1, currentPage + 1)}` }
     ]);
   }
-  rows.push([{ text: "\u2716", callback_data: "sdvg:media:close" }]);
+  rows.push([
+    { text: "\uD83D\uDD0E", callback_data: "sdvg:media:search" },
+    { text: "\u2716", callback_data: "sdvg:media:close" }
+  ]);
   return { inline_keyboard: rows };
 }
 
-async function showMediaPicker(token, chatId, scrape, segment, page = 0, messageId = null) {
+async function editMediaPickerMessage(token, chatId, page = 0, messageId = null) {
+  const ctx = currentSession.mediaPickCtx;
+  if (!ctx) return;
+  ctx.page = Number(page) || 0;
+  await saveSession(botContext.DATA_DIR, currentSession);
+  const payload = {
+    chat_id: chatId,
+    text: mediaPickerText(ctx),
+    parse_mode: "HTML",
+    reply_markup: buildMediaPickerMarkup(ctx, ctx.page)
+  };
+  if (messageId) {
+    await callApi(token, "editMessageText", { ...payload, message_id: messageId }).catch(async () => {
+      await callApi(token, "sendMessage", payload);
+    });
+  } else {
+    await callApi(token, "sendMessage", payload);
+  }
+}
+
+async function showMediaPicker(token, chatId, scrape, segment, page = 0, messageId = null, query = "") {
   const safeTopic = botContext.sanitizeMediaTopicName(segment.topic || "unsorted");
-  const files = mediaPickerFilesForTopic(await botContext.listMediaFiles(800), safeTopic);
+  const allFiles = mediaPickerFilesForTopic(await botContext.listMediaFiles(800), safeTopic);
+  const files = filterMediaPickerFiles(allFiles, query);
   currentSession.mediaPickCtx = {
     scrapeId: scrape.id,
     segmentId: segment.id,
     topic: safeTopic,
+    allFiles,
     files,
-    page: Number(page) || 0
+    page: Number(page) || 0,
+    query: String(query || "").trim()
   };
   await saveSession(botContext.DATA_DIR, currentSession);
 
-  const text = files.length
-    ? `Files for <code>${escapeHtml(safeTopic)}</code>\nPick a file to attach. Then you can set its timecode.`
-    : "No media files found.";
   const payload = {
     chat_id: chatId,
-    text,
+    text: mediaPickerText(currentSession.mediaPickCtx),
     parse_mode: "HTML",
     reply_markup: buildMediaPickerMarkup(currentSession.mediaPickCtx, page)
   };
@@ -2322,6 +3371,140 @@ async function showMediaPicker(token, chatId, scrape, segment, page = 0, message
   } else {
     await callApi(token, "sendMessage", payload);
   }
+}
+
+async function showRemotionBackgroundPicker(token, chatId, page = 0, messageId = null) {
+  let topic = "unsorted";
+  let segmentId = "";
+  let scrapeId = "";
+  if (currentSession.scrapeId && currentSession.activeSegmentId) {
+    scrapeId = currentSession.scrapeId;
+    segmentId = currentSession.activeSegmentId;
+    try {
+      const scrape = await botContext.readScrape(scrapeId);
+      const segment = (scrape.segments || []).find((s) => s.id === segmentId);
+      if (segment) {
+        topic = botContext.sanitizeMediaTopicName(segment.topic || "unsorted");
+      }
+    } catch {
+      // fallback to unsorted
+    }
+  }
+
+  const files = mediaPickerFilesForTopic(await botContext.listMediaFiles(800), topic);
+  
+  currentSession.remotionBgPickCtx = {
+    scrapeId,
+    segmentId,
+    topic,
+    files,
+    page: Number(page) || 0
+  };
+  if (currentSession.remotionCtx) {
+    currentSession.remotionCtx.awaitField = "background";
+    currentSession.remotionCtx.panelMessageId = messageId || currentSession.remotionCtx.panelMessageId;
+  }
+  await saveSession(botContext.DATA_DIR, currentSession);
+
+  const text = [
+    `🖼️ <b>Выбор фона</b> (папка <code>${escapeHtml(topic)}</code>)`,
+    "Выберите медиа-файл ниже. Он установится как фон карточки UContent и прикрепится к вашему активному сегменту.",
+    "",
+    "<i>Вы также можете просто отправить фото/видео файлом в чат или написать путь текстом.</i>"
+  ].join("\n");
+
+  const payload = {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    reply_markup: buildRemotionBgPickerMarkup(currentSession.remotionBgPickCtx, page)
+  };
+
+  if (messageId) {
+    await callApi(token, "editMessageText", { ...payload, message_id: messageId }).catch(async () => {
+      await callApi(token, "sendMessage", payload);
+    });
+  } else {
+    await callApi(token, "sendMessage", payload);
+  }
+}
+
+function buildRemotionBgPickerMarkup(ctx, page = 0) {
+  const files = Array.isArray(ctx?.files) ? ctx.files : [];
+  const pageSize = 7;
+  const pages = Math.max(1, Math.ceil(files.length / pageSize));
+  const currentPage = Math.min(Math.max(0, Number(page) || 0), pages - 1);
+  const start = currentPage * pageSize;
+  const rows = files.slice(start, start + pageSize).map((file, offset) => {
+    const index = start + offset;
+    const prefix = String(file.topic || "").trim() ? `${file.topic}/` : "";
+    const label = `${prefix}${formatMediaItemName(file)}`;
+    return [{ text: label.length > 48 ? `${label.slice(0, 45)}...` : label, callback_data: `sdvg:remotion:bg:sel:${index}` }];
+  });
+  if (pages > 1) {
+    rows.push([
+      { text: "<", callback_data: `sdvg:remotion:bg:page:${Math.max(0, currentPage - 1)}` },
+      { text: `${currentPage + 1}/${pages}`, callback_data: "sdvg:remotion:bg:noop" },
+      { text: ">", callback_data: `sdvg:remotion:bg:page:${Math.min(pages - 1, currentPage + 1)}` }
+    ]);
+  }
+  rows.push([
+    { text: "Очистить фон", callback_data: "sdvg:remotion:bg:clear" },
+    { text: "Назад", callback_data: "sdvg:remotion:bg:back" }
+  ]);
+  return { inline_keyboard: rows };
+}
+
+async function selectRemotionBackground(token, chatId, fileIndex, callbackMessageId) {
+  const ctx = currentSession.remotionBgPickCtx;
+  const file = Array.isArray(ctx?.files) ? ctx.files[fileIndex] : null;
+  if (!ctx || !file) {
+    await callApi(token, "sendMessage", { chat_id: chatId, text: "Список файлов устарел. Откройте выбор фона заново." });
+    return;
+  }
+  
+  const draft = currentSession.remotionCtx?.draft;
+  if (draft) {
+    draft.props.background = { image: file.path, dim: 0.62, blur: 0 };
+    currentSession.remotionCtx.awaitField = null;
+    await saveSession(botContext.DATA_DIR, currentSession);
+  }
+
+  // Attach to active segment if it exists
+  if (ctx.scrapeId && ctx.segmentId) {
+    try {
+      const freshScrape = await botContext.readScrape(ctx.scrapeId);
+      const segIdx = (freshScrape.segments || []).findIndex((s) => s.id === ctx.segmentId);
+      if (segIdx >= 0) {
+        const segment = freshScrape.segments[segIdx];
+        const items = Array.isArray(segment.media_items) ? segment.media_items : [];
+        const alreadyAttached = items.some((item) => String(item?.path || "") === String(file.path || ""));
+        if (!alreadyAttached) {
+          const newItem = {
+            path: file.path,
+            name: file.name,
+            topic: ctx.topic,
+            size: file.size || 0,
+            thumbnail: isImageFile(file.path) ? `/api/media/raw?path=${encodeURIComponent(file.path)}` : "",
+            title: file.name || path.basename(file.path),
+            updated_at: new Date().toISOString()
+          };
+          segment.media_items = [...items, newItem].slice(0, 50);
+          segment.media = segment.media_items[0] || null;
+          segment.updated_at = new Date().toISOString();
+          await botContext.writeScrape(freshScrape);
+        }
+      }
+    } catch (error) {
+      console.error("[remotion-bg-attach] Failed to attach media to segment:", error);
+    }
+  }
+
+  currentSession.remotionBgPickCtx = null;
+  await saveSession(botContext.DATA_DIR, currentSession);
+  
+  // Show the main remotion panel again
+  await showRemotionPanel(token, chatId, callbackMessageId);
 }
 
 function resolvePickedMediaPath(file) {
@@ -2384,6 +3567,17 @@ function attachRenameTargetMessage(renameId, chatId, messageId) {
   return true;
 }
 
+function attachRenameTargetAlbumMessage(renameId, chatId, messageId) {
+  const id = String(renameId || "");
+  const msgId = Number(messageId);
+  if (!id || !Number.isFinite(msgId)) return false;
+  const target = (currentSession.renameTargets || []).find((item) => item?.id === id);
+  if (!target) return false;
+  target.albumChatId = chatId;
+  target.albumMessageId = msgId;
+  return true;
+}
+
 function rememberFolderMoveContext(messageId, context) {
   const key = String(messageId || "");
   if (!key || !context) return;
@@ -2409,10 +3603,15 @@ function currentFolderFromRelPath(relPath) {
   return String(relPath || "").replace(/^[/\\]+/, "").split(/[\\/]/)[0] || "";
 }
 
+function confirmedFolderFromRelPath(relPath) {
+  const parts = String(relPath || "").replace(/^[/\\]+/, "").split(/[\\/]/).filter(Boolean);
+  return parts.length > 1 ? parts[0] : "";
+}
+
 async function listMediaTopicFolders() {
   const root = path.resolve(botContext.PAMPAM_ROOT);
   const entries = await fs.readdir(root, { withFileTypes: true }).catch(() => []);
-  const hidden = new Set(["_download_staging", "_quarantine", "_originals"]);
+  const hidden = new Set(["_download_staging", "_quarantine", "_originals", "work", "graphics", "archive_projects", "logos"]);
   const folders = await Promise.all(entries
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
@@ -2425,6 +3624,33 @@ async function listMediaTopicFolders() {
     if (b.mtime !== a.mtime) return b.mtime - a.mtime;
     return a.name.localeCompare(b.name, "ru", { sensitivity: "base" });
   }).map((folder) => folder.name);
+}
+
+async function mediaTopicFolderExists(topic) {
+  const safeTopic = botContext.sanitizeMediaTopicName(topic || "");
+  if (!safeTopic || safeTopic.toLowerCase() === "unsorted") return true;
+  const root = path.resolve(botContext.PAMPAM_ROOT);
+  const folderPath = path.resolve(root, safeTopic);
+  if (folderPath !== root && !folderPath.startsWith(`${root}${path.sep}`)) return false;
+  const stats = await fs.stat(folderPath).catch(() => null);
+  return Boolean(stats?.isDirectory?.());
+}
+
+async function resolveCurrentDownloadTopic() {
+  const requested = botContext.sanitizeMediaTopicName(currentSession.currentDownloadFolder || "");
+  if (!requested || requested.toLowerCase() === "unsorted") return "unsorted";
+  if (await mediaTopicFolderExists(requested)) return requested;
+  currentSession.currentDownloadFolder = "";
+  await saveSession(botContext.DATA_DIR, currentSession).catch(() => null);
+  return "unsorted";
+}
+
+async function rememberCurrentDownloadTopic(topic) {
+  const safeTopic = botContext.sanitizeMediaTopicName(topic || "");
+  if (!safeTopic || !(await mediaTopicFolderExists(safeTopic))) return false;
+  currentSession.currentDownloadFolder = safeTopic.toLowerCase() === "unsorted" ? "" : safeTopic;
+  await saveSession(botContext.DATA_DIR, currentSession);
+  return true;
 }
 
 async function resultIsConfirmedInFolder(result, folderName) {
@@ -2464,7 +3690,7 @@ function buildFolderPickerMarkup(context = {}) {
     ]);
   }
   rows.push([
-    { text: "+", callback_data: "sdvg:folder:new" },
+    { text: "\uD83D\uDCC1\u2795", callback_data: "sdvg:folder:new" },
     { text: "↩", callback_data: "sdvg:folder:close" }
   ]);
   return { inline_keyboard: rows };
@@ -2483,7 +3709,7 @@ async function moveMediaFileEverywhere(target, requestedTopic) {
     return { oldRel, newRel: oldRel, oldName, newName: oldName, changed: false, size: stats.size };
   }
 
-  const nextName = await ensureUniqueFileNameInDir(dir, oldName);
+  const nextName = await ensureUniqueFileNameInDir(dir, premiereSafeMediaFileName(oldName, "media"));
   const nextAbs = path.join(dir, nextName);
   await fs.rename(oldAbs, nextAbs);
   const nextRel = mediaRelPathFromAbsolute(nextAbs);
@@ -2580,6 +3806,9 @@ function renameButtonMarkup(renameId, rows = [], screenshotId = "") {
     }
     controlRow.push({ text: "\uD83D\uDCC1", callback_data: `sdvg:folder:open:${renameId}` });
     controlRow.push({ text: "\u270F\uFE0F", callback_data: `sdvg:rename:${renameId}` });
+    if (target) {
+      controlRow.push({ text: "\uD83D\uDDD1\uFE0F", callback_data: `sdvg:delete:${renameId}` });
+    }
   }
   if (screenshotId) {
     controlRow.push({ text: "\uD83D\uDCF8", callback_data: `sdvg:snap:${screenshotId}` });
@@ -2605,6 +3834,7 @@ function downloadGroupMarkup(groupRenameId, videoRenameIds = []) {
   if (groupRenameId) {
     controlRow.push({ text: "\uD83D\uDCC1", callback_data: `sdvg:folder:open:${groupRenameId}` });
     controlRow.push({ text: "\u270F\uFE0F", callback_data: `sdvg:rename:${groupRenameId}` });
+    controlRow.push({ text: "\uD83D\uDDD1\uFE0F", callback_data: `sdvg:delete:${groupRenameId}` });
   }
   if (controlRow.length) {
     controlRow.push({ text: "\u2714\uFE0F", callback_data: "sdvg:clear_buttons" });
@@ -2617,7 +3847,7 @@ async function sendStandaloneScreenshot(token, chatId, rawUrl) {
   const url = String(rawUrl || "").trim();
   if (!url) throw new Error("Пустая ссылка");
   const { safeTopic, dir } = await botContext.ensureTopicDir("unsorted");
-  const profile = defaultShotProfileForScrape(currentSession.scrapeId);
+  const profile = defaultShotProfileForUrl(url, currentSession.scrapeId);
   const buf = await captureScreenshot(url, profile);
   const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
   const shotName = await ensureUniqueFileNameInDir(dir, safeTelegramUploadFileName(`${hostLabelForFileName(url)}_${stamp}.png`, "screenshot.png"));
@@ -2653,10 +3883,10 @@ async function renameMediaFileEverywhere(target, requestedName) {
   const oldExt = path.extname(oldName) || ".bin";
   const requestedExt = path.extname(rawName);
   const wantedName = requestedExt ? rawName : `${rawName}${oldExt}`;
-  const cleanName = safeTelegramUploadFileName(wantedName, path.basename(oldName, oldExt));
+  const cleanName = premiereSafeMediaFileName(wantedName, path.basename(oldName, oldExt));
   const nextName = await ensureUniqueFileNameInDir(path.dirname(oldAbs), cleanName, oldName);
   if (nextName === oldName) {
-    return { oldRel, newRel: oldRel, oldName, newName: oldName, changed: false, size: stats.size };
+    return { oldRel, newRel: oldRel, oldName, newName: oldName, changed: false, size: stats.size, folder: confirmedFolderFromRelPath(oldRel) };
   }
 
   const nextAbs = path.join(path.dirname(oldAbs), nextName);
@@ -2713,7 +3943,7 @@ async function renameMediaFileEverywhere(target, requestedName) {
     }
   }
 
-  return { oldRel, newRel: nextRel, oldName, newName: nextName, changed: true, size: nextStats?.size ?? stats.size };
+  return { oldRel, newRel: nextRel, oldName, newName: nextName, changed: true, size: nextStats?.size ?? stats.size, folder: confirmedFolderFromRelPath(nextRel) };
 }
 
 async function renameMediaGroupEverywhere(target, requestedName) {
@@ -2729,10 +3959,92 @@ async function renameMediaGroupEverywhere(target, requestedName) {
     const extension = path.extname(currentPath) || ".bin";
     results.push(await renameMediaFileEverywhere(
       { path: currentPath },
-      `${baseName}_${index + 1}${extension}`
+      premiereSafeMediaFileName(`${baseName}_${index + 1}${extension}`, "media")
     ));
   }
   return results;
+}
+
+async function deleteMediaFileEverywhere(target) {
+  const relPath = String(target?.path || "").replace(/^[/\\]+/, "");
+  if (!relPath) throw new Error("Файл больше не найден");
+  const absolutePath = resolveMediaPathFromRel(relPath);
+  if (absolutePath) await fs.unlink(absolutePath).catch(() => null);
+  await botContext.removeMediaMetadata?.(relPath).catch(() => null);
+
+  let removedFromScrape = 0;
+  if (currentSession.scrapeId) {
+    const scrape = await botContext.readScrape(currentSession.scrapeId).catch(() => null);
+    if (scrape) {
+      let changed = false;
+      for (const segment of scrape.segments || []) {
+        const before = Array.isArray(segment.media_items) ? segment.media_items : [];
+        const after = before.filter((item) => String(item?.path || "") !== relPath);
+        if (after.length !== before.length) {
+          segment.media_items = after;
+          segment.media = after[0] || null;
+          segment.updated_at = new Date().toISOString();
+          removedFromScrape += before.length - after.length;
+          changed = true;
+        } else if (segment.media && String(segment.media.path || "") === relPath) {
+          segment.media = after[0] || null;
+          segment.updated_at = new Date().toISOString();
+          removedFromScrape += 1;
+          changed = true;
+        }
+      }
+      if (changed) await botContext.writeScrape(scrape);
+    }
+  }
+
+  currentSession.renameTargets = (currentSession.renameTargets || []).filter((entry) => entry?.id !== target.id);
+  if (currentSession.mediaPickCtx?.files) {
+    currentSession.mediaPickCtx.files = currentSession.mediaPickCtx.files.filter((file) => String(file?.path || "") !== relPath);
+  }
+  return { relPath, removedFromScrape };
+}
+
+async function deleteMediaTargetEverywhere(target) {
+  if (target?.isGroup) {
+    const paths = [...new Set((target.paths || []).map((item) => String(item || "").replace(/^[/\\]+/, "")).filter(Boolean))];
+    if (!paths.length) throw new Error("Группа файлов больше не найдена");
+    const removed = [];
+    for (const relPath of paths) {
+      const result = await deleteMediaFileEverywhere({ ...target, isGroup: false, path: relPath });
+      removed.push(result.relPath);
+    }
+    const removedSet = new Set(removed);
+    currentSession.renameTargets = (currentSession.renameTargets || []).filter((entry) => {
+      if (entry?.id === target.id) return false;
+      if (removedSet.has(String(entry?.path || ""))) return false;
+      if (Array.isArray(entry?.paths) && entry.paths.some((item) => removedSet.has(String(item || "")))) return false;
+      return true;
+    });
+    return { relPath: removed[0] || "", relPaths: removed, removedFromScrape: removed.length };
+  }
+  return deleteMediaFileEverywhere(target);
+}
+
+async function normalizeScrapeMediaFileNamesForPremiere(scrape) {
+  const paths = new Set();
+  for (const segment of scrape?.segments || []) {
+    for (const item of segment.media_items || []) {
+      const relPath = String(item?.path || "").replace(/^[/\\]+/, "");
+      if (relPath) paths.add(relPath);
+    }
+    const primaryPath = String(segment.media?.path || "").replace(/^[/\\]+/, "");
+    if (primaryPath) paths.add(primaryPath);
+  }
+
+  const changed = [];
+  for (const relPath of paths) {
+    const currentName = path.basename(relPath);
+    const safeName = premiereSafeMediaFileName(currentName, "media");
+    if (!safeName || safeName === currentName) continue;
+    const result = await renameMediaFileEverywhere({ path: relPath }, safeName);
+    if (result.changed) changed.push(result);
+  }
+  return changed;
 }
 
 async function updateRenamedTelegramMessage(token, chatId, ctx, target, result, options = {}) {
@@ -2740,11 +4052,16 @@ async function updateRenamedTelegramMessage(token, chatId, ctx, target, result, 
   const targetChatId = target?.chatId || ctx?.chatId || chatId;
   if (!Number.isFinite(messageId) || messageId <= 0 || !targetChatId) return false;
   const sourceUrl = String(target?.sourceUrl || ctx?.sourceUrl || "").trim();
+  const nextName = result?.newName || path.basename(result?.newRel || target?.path || "");
+  const nextRel = String(result?.newRel || target?.path || ctx?.path || "").replace(/^[/\\]+/, "");
+  const folderName = String(options.folderName || result?.folder || confirmedFolderFromRelPath(result?.newRel || target?.path || ctx?.path || "")).trim();
+  const displayTitle = parseTitleFromFileName(nextName) || nextName;
+  const metadata = await metadataForRenamedMedia(nextRel, nextName, sourceUrl, folderName, displayTitle);
   const caption = buildReturnedMediaCaption({
-    fileName: result?.newName || path.basename(result?.newRel || target?.path || ""),
+    fileName: nextName,
     sourceUrl,
     sizeBytes: result?.size || 0,
-    metadata: { webpage_url: sourceUrl, folder: options.folderName || "" }
+    metadata
   });
   const replyMarkup = target?.id ? renameButtonMarkup(target.id) : undefined;
   const captionPayload = {
@@ -2771,6 +4088,185 @@ async function updateRenamedTelegramMessage(token, chatId, ctx, target, result, 
     return null;
   });
   return Boolean(textResult);
+}
+
+async function buildGroupReturnedCaption(target, results = [], options = {}) {
+  const paths = Array.isArray(target?.paths) && target.paths.length
+    ? target.paths
+    : [target?.path].filter(Boolean);
+  const firstResult = Array.isArray(results) ? results[0] : results;
+  const firstRel = String(firstResult?.newRel || paths[0] || target?.path || "").replace(/^[/\\]+/, "");
+  const firstName = path.basename(firstRel || firstResult?.newName || "media");
+  let totalSize = 0;
+  for (const relPath of paths) {
+    const absolutePath = resolveMediaPathFromRel(relPath);
+    const stats = absolutePath ? await fs.stat(absolutePath).catch(() => null) : null;
+    totalSize += Number(stats?.size || 0);
+  }
+  if (!totalSize && firstResult?.size) totalSize = Number(firstResult.size || 0);
+  const sourceUrl = String(target?.sourceUrl || options.sourceUrl || "").trim();
+  const folderName = String(options.folderName || firstResult?.folder || confirmedFolderFromRelPath(firstRel || target?.path || "")).trim();
+  const displayTitle = parseTitleFromFileName(firstName.replace(/_\d{1,3}(?=\.[^.]+$)/, "")) || parseTitleFromFileName(firstName) || firstName;
+  const metadata = await metadataForRenamedMedia(firstRel, firstName, sourceUrl, folderName, displayTitle);
+  return buildReturnedMediaCaption({
+    fileName: firstName,
+    sourceUrl,
+    sizeBytes: totalSize,
+    metadata
+  });
+}
+
+async function updateGroupTelegramMessages(token, chatId, ctx, target, results = [], options = {}) {
+  const caption = await buildGroupReturnedCaption(target, results, options);
+  const replyMarkup = target?.id ? renameButtonMarkup(target.id) : undefined;
+  let updated = false;
+  const albumMessageId = Number(target?.albumMessageId || ctx?.albumMessageId || 0);
+  const albumChatId = target?.albumChatId || ctx?.albumChatId || chatId;
+  if (Number.isFinite(albumMessageId) && albumMessageId > 0 && albumChatId) {
+    const albumResult = await callApi(token, "editMessageCaption", {
+      chat_id: albumChatId,
+      message_id: albumMessageId,
+      caption,
+      parse_mode: "HTML"
+    }).catch((error) => {
+      if (/message is not modified/i.test(String(error?.message || ""))) return true;
+      return null;
+    });
+    updated = Boolean(albumResult) || updated;
+  }
+  const controlMessageId = Number(target?.messageId || ctx?.messageId || 0);
+  const controlChatId = target?.chatId || ctx?.chatId || chatId;
+  if (Number.isFinite(controlMessageId) && controlMessageId > 0 && controlChatId) {
+    const textResult = await callApi(token, "editMessageText", {
+      chat_id: controlChatId,
+      message_id: controlMessageId,
+      text: `<b>Управление альбомом</b>\n${caption}`,
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {})
+    }).catch((error) => {
+      if (/message is not modified/i.test(String(error?.message || ""))) return true;
+      return null;
+    });
+    updated = Boolean(textResult) || updated;
+  }
+  return updated;
+}
+
+function renamedResultToSendEntry(result) {
+  const relPath = String(result?.newRel || "").replace(/^[/\\]+/, "");
+  const absolutePath = relPath ? resolveMediaPathFromRel(relPath) : "";
+  if (!absolutePath) return null;
+  return {
+    path: absolutePath,
+    relPath,
+    name: result?.newName || path.basename(absolutePath),
+    size: result?.size || 0
+  };
+}
+
+async function sourceUrlForMediaRelPath(relPath, fallback = "") {
+  const direct = String(fallback || "").trim();
+  if (direct) return direct;
+  const metadata = relPath ? await botContext.getMediaMetadata?.(relPath).catch(() => null) : null;
+  const source = String(metadata?.source_url || metadata?.webpage_url || metadata?.url || "").trim();
+  if (source) return source;
+  const parentPath = String(metadata?.parent_path || "").trim();
+  if (!parentPath || parentPath === relPath) return "";
+  const parent = await botContext.getMediaMetadata?.(parentPath).catch(() => null);
+  return String(parent?.source_url || parent?.webpage_url || parent?.url || "").trim();
+}
+
+async function metadataForRenamedMedia(relPath, fileName, sourceUrl, folderName, displayTitle = "") {
+  const resolvedSourceUrl = await sourceUrlForMediaRelPath(relPath, sourceUrl);
+  const metadata = {
+    display_title: displayTitle || parseTitleFromFileName(fileName) || fileName,
+    title: fileName,
+    webpage_url: resolvedSourceUrl,
+    folder: folderName
+  };
+  const indexed = await botContext.getMediaMetadata?.(relPath).catch(() => null);
+  Object.assign(metadata, metadataFromMediaItem(indexed || {}));
+  metadata.display_title = displayTitle || parseTitleFromFileName(fileName) || fileName;
+  metadata.title = fileName;
+  metadata.webpage_url = resolvedSourceUrl || metadata.webpage_url || metadata.source_url || "";
+  metadata.source_url = resolvedSourceUrl || metadata.source_url || metadata.webpage_url || "";
+  metadata.folder = folderName || metadata.folder || confirmedFolderFromRelPath(relPath);
+  if (isVideoFilePath(fileName) && (!metadata.resolution || !metadata.format_note)) {
+    const absolutePath = resolveMediaPathFromRel(relPath);
+    const probe = absolutePath ? await probeVideoForTelegram(absolutePath).catch(() => null) : null;
+    if (probe?.width && probe?.height) {
+      metadata.resolution = metadata.resolution || `${probe.width}x${probe.height}`;
+      metadata.format_note = metadata.format_note || `${Math.min(probe.width, probe.height)}p`;
+    }
+  }
+  return metadata;
+}
+
+async function sendRenamedMediaBack(token, chatId, target, results, sourceUrl = "") {
+  const list = (Array.isArray(results) ? results : [results])
+    .map(renamedResultToSendEntry)
+    .filter(Boolean);
+  const existing = [];
+  for (const entry of list) {
+    const stats = await fs.stat(entry.path).catch(() => null);
+    if (!stats?.isFile?.()) continue;
+    entry.size = stats.size;
+    existing.push(entry);
+  }
+  if (!existing.length) return;
+
+  const source = String(sourceUrl || target?.sourceUrl || "").trim();
+  const totalSize = existing.reduce((sum, entry) => sum + (entry.size || 0), 0);
+  const singleMetadata = existing.length === 1
+    ? await metadataForRenamedMedia(
+      existing[0].relPath,
+      existing[0].name,
+      source,
+      confirmedFolderFromRelPath(existing[0].relPath),
+      parseTitleFromFileName(existing[0].name) || existing[0].name
+    )
+    : null;
+  const caption = existing.length > 1
+    ? `📦 Переименовано: ${existing.length} файла\n${existing.map((entry) => `• ${escapeHtml(entry.name)}`).join("\n")}`
+    : buildReturnedMediaCaption({
+      fileName: existing[0].name,
+      sourceUrl: source,
+      sizeBytes: totalSize,
+      metadata: singleMetadata
+    });
+
+  const renameId = target?.id || "";
+  const albumEntries = existing.filter((entry) => /\.(jpe?g|png|mp4|m4v|mov)$/i.test(entry.name));
+  if (existing.length > 1 && albumEntries.length === existing.length) {
+    const sentMessages = await sendLocalMediaGroup(token, chatId, albumEntries, caption);
+    const firstMessageId = Array.isArray(sentMessages) ? sentMessages[0]?.message_id : null;
+    if (renameId && firstMessageId) {
+      attachRenameTargetAlbumMessage(renameId, chatId, firstMessageId);
+      const controlMsg = await callApi(token, "sendMessage", {
+        chat_id: chatId,
+        text: `<b>Управление альбомом</b>\n${caption}`,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: renameButtonMarkup(renameId)
+      }).catch(() => null);
+      if (controlMsg?.message_id) attachRenameTargetMessage(renameId, chatId, controlMsg.message_id);
+      await saveSession(botContext.DATA_DIR, currentSession);
+    }
+    return;
+  }
+
+  for (let index = 0; index < existing.length; index += 1) {
+    const entry = existing[index];
+    const sentMessage = await sendLocalMedia(token, {
+      chat_id: chatId,
+      ...(index === 0 ? { caption, parse_mode: "HTML" } : {}),
+      ...(index === 0 && renameId ? { reply_markup: renameButtonMarkup(renameId) } : {})
+    }, entry.path, entry.name);
+    if (index === 0 && renameId && sentMessage?.message_id) {
+      attachRenameTargetMessage(renameId, chatId, sentMessage.message_id);
+    }
+  }
 }
 
 function derivedOutputDirectory(sourcePath) {
@@ -2862,6 +4358,43 @@ function formatSeconds(value) {
   return h > 0
     ? `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
     : `${m}:${String(s).padStart(2, "0")}`;
+}
+
+function formatTrimTimeForFile(value) {
+  const centiseconds = Math.max(0, Math.round(Number(value || 0) * 100));
+  const totalSeconds = Math.floor(centiseconds / 100);
+  const cs = centiseconds % 100;
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = totalSeconds % 60;
+  const base = h > 0
+    ? `${String(h).padStart(2, "0")}h${String(m).padStart(2, "0")}m${String(s).padStart(2, "0")}s`
+    : `${String(m).padStart(2, "0")}m${String(s).padStart(2, "0")}s`;
+  return cs > 0 ? `${base}${String(cs).padStart(2, "0")}cs` : base;
+}
+
+function trimSegmentsFileLabel(segments = []) {
+  const ranges = (Array.isArray(segments) ? segments : [])
+    .map((segment) => `${formatTrimTimeForFile(segment.start)}-${formatTrimTimeForFile(segment.end)}`)
+    .filter(Boolean);
+  if (!ranges.length) return "trim";
+  const visible = ranges.slice(0, 4);
+  const suffix = ranges.length > visible.length ? `_plus${ranges.length - visible.length}` : "";
+  return `trim_${visible.join("__")}${suffix}`;
+}
+
+function boundedTrimOutputFileName(sourceName, segments = [], ext = ".mp4") {
+  const safeExt = asciiFilePart(String(ext || ".mp4").replace(/^\.+/, ""), "mp4").slice(0, 10);
+  const extension = `.${safeExt || "mp4"}`;
+  const trimLabel = asciiFilePart(trimSegmentsFileLabel(segments), "trim");
+  const maxStemLength = Math.max(32, GENERATED_MEDIA_FILENAME_MAX - extension.length);
+  const baseLimit = Math.max(12, maxStemLength - trimLabel.length - 1);
+  const parsed = path.parse(String(sourceName || "video"));
+  const base = asciiFilePart(parsed.name || "video", "video")
+    .slice(0, baseLimit)
+    .replace(/[._-]+$/g, "");
+  const stem = `${base || "video"}_${trimLabel}`.slice(0, maxStemLength).replace(/[._-]+$/g, "");
+  return `${stem || `video_${trimLabel}`}${extension}`;
 }
 
 function parseTrimTime(value) {
@@ -2981,7 +4514,7 @@ async function startManualTrim(token, chatId, target) {
     id,
     targetId: target.id,
     relPath: target.path,
-    sourceUrl: target.sourceUrl || "",
+    sourceUrl: await sourceUrlForMediaRelPath(target.path, target.sourceUrl || ""),
     duration,
     segments: [{ start: 0, end: duration }],
     messageId: null,
@@ -3009,7 +4542,7 @@ async function exportManualTrim(job) {
   if (!sourcePath || !stats?.isFile?.()) throw new Error("Исходное видео не найдено");
   const outDir = derivedOutputDirectory(sourcePath);
   const parsed = path.parse(path.basename(job.relPath));
-  const outputName = await ensureUniqueFileNameInDir(outDir, safeTelegramUploadFileName(`${parsed.name}_trim.mp4`, "trim.mp4"));
+  const outputName = await ensureUniqueBoundedFileNameInDir(outDir, boundedTrimOutputFileName(parsed.base, job.segments, ".mp4"));
   const outputPath = path.join(outDir, outputName);
   await execFileAsync(findPythonExecutable(), [
     sceneCutterCliPath(), "trim",
@@ -3022,9 +4555,9 @@ async function exportManualTrim(job) {
 
 async function sendCutModeMenu(token, chatId, target) {
   if (!target.sourceUrl) {
-    const indexed = await botContext.getMediaMetadata?.(target.path);
-    if (indexed?.source_url) {
-      target.sourceUrl = indexed.source_url;
+    const sourceUrl = await sourceUrlForMediaRelPath(target.path);
+    if (sourceUrl) {
+      target.sourceUrl = sourceUrl;
       await saveSession(botContext.DATA_DIR, currentSession);
     }
   }
@@ -3504,6 +5037,11 @@ function isImageFile(filename) {
   return /\.(jpg|jpeg|png|webp|gif|bmp)$/i.test(filename);
 }
 
+function shouldDeleteSourceMediaMessage(media = {}) {
+  const type = String(media?.type || "").toLowerCase();
+  return ["photo", "video", "document", "sticker", "animation", "audio", "voice", "video_note"].includes(type);
+}
+
 function telegramMessageSource(message) {
   const origin = message?.forward_origin || null;
   const channel = origin?.type === "channel" ? origin.chat : message?.forward_from_chat;
@@ -3517,15 +5055,66 @@ function telegramMessageSource(message) {
   };
 }
 
+function telegramMessageDate(message) {
+  const timestamp = Number(message?.date || 0);
+  const date = timestamp > 0 ? new Date(timestamp * 1000) : new Date();
+  return Number.isNaN(date.getTime()) ? new Date() : date;
+}
+
+function pad2(value) {
+  return String(value).padStart(2, "0");
+}
+
+function telegramMessageStamp(message) {
+  const date = telegramMessageDate(message);
+  const year = date.getFullYear();
+  const month = pad2(date.getMonth() + 1);
+  const day = pad2(date.getDate());
+  const hour = pad2(date.getHours());
+  const minute = pad2(date.getMinutes());
+  const second = pad2(date.getSeconds());
+  return {
+    file: `${year}${month}${day}_${hour}${minute}${second}`,
+    label: `${year}-${month}-${day} ${hour}:${minute}`
+  };
+}
+
+function telegramMediaTypeLabel(type) {
+  return {
+    photo: "Фото",
+    video: "Видео",
+    document: "Документ",
+    sticker: "Стикер",
+    animation: "Анимация",
+    audio: "Аудио",
+    voice: "Голосовое",
+    video_note: "Видеокружок"
+  }[String(type || "").toLowerCase()] || "Медиа";
+}
+
+function telegramDirectMediaTitle(message, media = {}) {
+  const stamp = telegramMessageStamp(message);
+  return `${telegramMediaTypeLabel(media?.type)} ${stamp.label}`;
+}
+
+function telegramDirectMediaStem(message, media = {}) {
+  const stamp = telegramMessageStamp(message);
+  const type = asciiFilePart(media?.type || "media", "media");
+  const unique = asciiFilePart(media?.fileUniqueId || message?.message_id || "", "").slice(0, 18);
+  return ["telegram", type, stamp.file, unique].filter(Boolean).join("_");
+}
+
 function telegramMessageTitle(message, media = {}) {
   const source = telegramMessageSource(message);
   const caption = cleanupCaptionText(message?.caption || message?.text || "");
   const captionLine = caption.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || "";
   const sourceTitle = cleanupCaptionText(source.source_title || "");
   const mediaName = cleanupCaptionText(media?.fileName || "");
+  const mediaStem = path.parse(mediaName).name || mediaName;
+  const directTitle = telegramDirectMediaTitle(message, media);
   return {
-    title: captionLine || sourceTitle || mediaName,
-    description: caption || sourceTitle || mediaName,
+    title: captionLine || sourceTitle || (!isGenericMediaStem(mediaStem) && !looksGenericDownloaderTitle(mediaStem) ? mediaName : directTitle),
+    description: caption || sourceTitle || directTitle,
     source
   };
 }
@@ -3535,14 +5124,99 @@ function descriptiveTelegramMediaFileName(message, media, topicPrefix = "") {
   const parsed = path.parse(original);
   const ext = parsed.ext || (media?.type === "photo" ? ".jpg" : media?.type === "sticker" ? ".webp" : ".bin");
   const currentStem = asciiFilePart(parsed.name || "", "");
-  if (currentStem && !isGenericMediaStem(currentStem)) return safeTelegramUploadFileName(original, media?.type || "media", topicPrefix);
+  const topicStem = asciiFilePart(topicPrefix, "").slice(0, 48).replace(/[._-]+$/g, "");
+  if (currentStem && !isGenericMediaStem(currentStem) && !looksGenericDownloaderTitle(currentStem)) {
+    const stem = topicStem && topicStem !== "unsorted" && !currentStem.startsWith(`${topicStem}_`)
+      ? `${topicStem}_${currentStem}`
+      : currentStem;
+    return safeTelegramUploadFileName(`${stem}${ext}`, media?.type || "media");
+  }
   const meta = telegramMessageTitle(message, media);
   const label = [meta.title, meta.description, meta.source.source_title, meta.source.source_url]
     .find((value) => {
       const stem = asciiFilePart(value, "");
-      return stem && !isGenericMediaStem(stem);
+      return stem && !isGenericMediaStem(stem) && !looksGenericDownloaderTitle(stem);
     });
-  return safeTelegramUploadFileName(`${label || original}${ext}`, media?.type || "media", topicPrefix);
+  const fallbackStem = telegramDirectMediaStem(message, media) || media?.type || "media";
+  const safeTopicStem = topicStem && topicStem !== "unsorted" ? topicStem : "";
+  return safeTelegramUploadFileName(`${label || safeTopicStem || fallbackStem}${ext}`, media?.type || "media", topicPrefix);
+}
+
+function telegramGroupBaseStem(messages = [], medias = [], topicPrefix = "") {
+  const firstMessage = messages.find(Boolean) || {};
+  const firstMedia = medias.find(Boolean) || {};
+  const meta = telegramMessageTitle(firstMessage, firstMedia);
+  const topicStem = asciiFilePart(topicPrefix, "").slice(0, 48).replace(/[._-]+$/g, "");
+  const label = [meta.title, meta.description, meta.source.source_title, meta.source.source_url, topicStem]
+    .find((value) => {
+      const stem = asciiFilePart(value, "");
+      return stem && !isGenericMediaStem(stem) && !looksGenericDownloaderTitle(stem);
+    });
+  const stamp = telegramMessageStamp(firstMessage).file;
+  return asciiFilePart(label || `telegram_group_${stamp}`, "telegram_group").slice(0, 90).replace(/[._-]+$/g, "") || "telegram_group";
+}
+
+async function uniqueMediaPathForStem(dir, stem, extension, index) {
+  const suffix = String(index + 1).padStart(2, "0");
+  const cleanExt = extension || ".bin";
+  const cleanName = safeTelegramUploadFileName(`${stem}_${suffix}${cleanExt}`, "media");
+  let targetPath = path.join(dir, cleanName);
+  let counter = 1;
+  const parsed = path.parse(cleanName);
+  while (await fs.access(targetPath).then(() => true).catch(() => false)) {
+    targetPath = path.join(dir, `${parsed.name}_${counter}${parsed.ext}`);
+    counter += 1;
+  }
+  return targetPath;
+}
+
+async function saveTelegramMediaToTopic(token, message, media, { dir, safeTopic, stem, index, segmentId = "" }) {
+  const original = String(media?.fileName || `${media?.type || "media"}_${Date.now()}`).trim();
+  const parsed = path.parse(original);
+  const ext = parsed.ext || (media?.type === "photo" ? ".jpg" : media?.type === "sticker" ? ".webp" : ".bin");
+  let targetPath = await uniqueMediaPathForStem(dir, stem, ext, index);
+  await downloadTelegramFileToPath(token, media, targetPath);
+  const initialStats = await fs.stat(targetPath).catch(() => null);
+  if (isWebpFile(targetPath) && initialStats?.isFile?.()) {
+    const pngPath = await convertWebpToPng(targetPath);
+    await fs.unlink(targetPath).catch(() => null);
+    targetPath = pngPath;
+  }
+  const finalName = path.basename(targetPath);
+  const relPath = mediaRelPathFromAbsolute(targetPath);
+  const stats = await fs.stat(targetPath);
+  const mediaMeta = telegramMessageTitle(message, media);
+  const source = mediaMeta.source;
+  await botContext.upsertMediaMetadata?.(relPath, {
+    ...source,
+    derivation: "telegram",
+    title: mediaMeta.title,
+    description: mediaMeta.description,
+    size: stats.size,
+    segment_id: segmentId
+  }).catch(() => null);
+  const mediaItem = {
+    path: relPath,
+    name: finalName,
+    topic: safeTopic,
+    size: stats.size,
+    source_url: source.source_url,
+    title: mediaMeta.title,
+    description: mediaMeta.description,
+    uploader: source.source_title,
+    updated_at: new Date().toISOString(),
+    thumbnail: isImageFile(finalName) ? `/api/media/raw?path=${encodeURIComponent(relPath)}` : ""
+  };
+  return {
+    path: targetPath,
+    relPath,
+    name: finalName,
+    originalName: finalName,
+    size: stats.size,
+    mediaItem,
+    metadata: mediaMeta,
+    source
+  };
 }
 
 function isWebpFile(filename) {
@@ -3665,8 +5339,9 @@ async function downloadTelegramFileToPath(token, media, targetPath) {
 
 async function handleDownloadModeMediaMessage(token, message, media) {
   const chatId = message.chat.id;
-  const { dir } = await botContext.ensureTopicDir("unsorted");
-  const cleanName = descriptiveTelegramMediaFileName(message, media, "unsorted");
+  const topic = await resolveCurrentDownloadTopic();
+  const { dir, safeTopic } = await botContext.ensureTopicDir(topic);
+  const cleanName = descriptiveTelegramMediaFileName(message, media, safeTopic);
   let targetPath = path.join(dir, cleanName);
   let counter = 1;
   const ext = path.extname(cleanName);
@@ -3677,7 +5352,7 @@ async function handleDownloadModeMediaMessage(token, message, media) {
   }
   const statusMsg = await callApi(token, "sendMessage", {
     chat_id: chatId,
-    text: `Сохраняю в unsorted: <code>${escapeHtml(path.basename(targetPath))}</code>`,
+    text: `Сохраняю в ${escapeHtml(safeTopic)}: <code>${escapeHtml(path.basename(targetPath))}</code>`,
     parse_mode: "HTML"
   });
   try {
@@ -3714,7 +5389,8 @@ async function handleDownloadModeMediaMessage(token, message, media) {
             title: mediaMeta.title,
             description: mediaMeta.description,
             uploader: source.source_title,
-            webpage_url: source.source_url
+            webpage_url: source.source_url,
+            folder: safeTopic
           }
         }),
         parse_mode: "HTML",
@@ -3724,7 +5400,9 @@ async function handleDownloadModeMediaMessage(token, message, media) {
         await saveSession(botContext.DATA_DIR, currentSession);
       }
     }
-    await callApi(token, "deleteMessage", { chat_id: chatId, message_id: message.message_id }).catch(() => null);
+    if (shouldDeleteSourceMediaMessage(media)) {
+      await callApi(token, "deleteMessage", { chat_id: chatId, message_id: message.message_id }).catch(() => null);
+    }
     await callApi(token, "deleteMessage", { chat_id: chatId, message_id: statusMsg.message_id }).catch(() => null);
   } catch (error) {
     await callApi(token, "editMessageText", {
@@ -3735,8 +5413,173 @@ async function handleDownloadModeMediaMessage(token, message, media) {
   }
 }
 
+async function sendSavedTelegramMediaGroup(token, chatId, entries, caption, controlsMarkup, groupRenameId) {
+  let captionUsed = false;
+  let controlsAttached = false;
+  const albumEntries = entries.filter((entry) => /\.(jpe?g|png|mp4|m4v|mov)$/i.test(entry.name));
+  const standaloneEntries = entries.filter((entry) => !albumEntries.includes(entry));
+  for (let offset = 0; offset < albumEntries.length; offset += 10) {
+    const chunk = albumEntries.slice(offset, offset + 10);
+    if (chunk.length >= 2) {
+      const sentMessages = await sendLocalMediaGroup(token, chatId, chunk, captionUsed ? "" : caption);
+      const firstMessageId = Array.isArray(sentMessages) ? sentMessages[0]?.message_id : null;
+      if (!captionUsed && firstMessageId) {
+        attachRenameTargetAlbumMessage(groupRenameId, chatId, firstMessageId);
+        await saveSession(botContext.DATA_DIR, currentSession);
+      }
+      captionUsed = true;
+    } else {
+      standaloneEntries.unshift(...chunk);
+    }
+  }
+  for (const entry of standaloneEntries) {
+    const sentMessage = await sendLocalMedia(token, {
+      chat_id: chatId,
+      ...(!captionUsed ? { caption, parse_mode: "HTML" } : {}),
+      ...(!controlsAttached ? { reply_markup: controlsMarkup } : {})
+    }, entry.path, entry.name);
+    if (!controlsAttached && sentMessage?.message_id) {
+      attachRenameTargetMessage(groupRenameId, chatId, sentMessage.message_id);
+      await saveSession(botContext.DATA_DIR, currentSession);
+      controlsAttached = true;
+    }
+    captionUsed = true;
+  }
+  if (!controlsAttached && groupRenameId) {
+    const controlMsg = await callApi(token, "sendMessage", {
+      chat_id: chatId,
+      text: `<b>Управление альбомом</b>\n${caption}`,
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: controlsMarkup
+    });
+    if (controlMsg?.message_id) {
+      attachRenameTargetMessage(groupRenameId, chatId, controlMsg.message_id);
+      await saveSession(botContext.DATA_DIR, currentSession);
+    }
+  }
+}
+
+async function handleTelegramMediaGroup(token, chatId, records) {
+  const messages = records.map((record) => record.message);
+  const medias = records.map((record) => record.media);
+  const firstMessage = messages[0];
+  const firstMedia = medias[0];
+  const activeScrapeId = currentSession.scrapeId;
+  const activeSegmentId = currentSession.activeSegmentId;
+  const downloadModeOnly = !activeScrapeId || !activeSegmentId;
+  if (downloadModeOnly && !currentSession.downloadMode) {
+    await callApi(token, "sendMessage", {
+      chat_id: chatId,
+      text: "⚠️ Нет активного сегмента для прикрепления альбома. Откройте сегмент с помощью /sdvg или включите режим скачивания."
+    }).catch(() => null);
+    return;
+  }
+
+  let safeTopic = "";
+  let dir = "";
+  let scrape = null;
+  let segment = null;
+  let segmentIndex = -1;
+  if (downloadModeOnly) {
+    const topic = await resolveCurrentDownloadTopic();
+    ({ safeTopic, dir } = await botContext.ensureTopicDir(topic));
+  } else {
+    scrape = await botContext.readScrape(activeScrapeId);
+    segmentIndex = (scrape.segments || []).findIndex((item) => item.id === activeSegmentId);
+    if (segmentIndex < 0) throw new Error("Активный сегмент больше не найден");
+    segment = scrape.segments[segmentIndex];
+    safeTopic = botContext.sanitizeMediaTopicName(segment.topic || "unsorted");
+    ({ dir } = await botContext.ensureTopicDir(safeTopic));
+  }
+
+  const stem = telegramGroupBaseStem(messages, medias, safeTopic);
+  const statusMsg = await callApi(token, "sendMessage", {
+    chat_id: chatId,
+    text: `Сохраняю альбом ${records.length} файлов в ${escapeHtml(safeTopic)}...`,
+    parse_mode: "HTML"
+  });
+  try {
+    const entries = [];
+    for (let index = 0; index < records.length; index += 1) {
+      const saved = await saveTelegramMediaToTopic(token, records[index].message, records[index].media, {
+        dir,
+        safeTopic,
+        stem,
+        index,
+        segmentId: segment?.id || ""
+      });
+      entries.push(saved);
+    }
+
+    if (!downloadModeOnly && scrape && segment) {
+      const items = Array.isArray(segment.media_items) ? segment.media_items : [];
+      for (const entry of entries) items.push(entry.mediaItem);
+      segment.media_items = items;
+      segment.media = segment.media || items[0] || null;
+      segment.updated_at = new Date().toISOString();
+      scrape.segments[segmentIndex] = segment;
+      await botContext.writeScrape(scrape);
+    }
+
+    const totalSize = entries.reduce((sum, entry) => sum + Number(entry.size || 0), 0);
+    const firstMeta = telegramMessageTitle(firstMessage, firstMedia);
+    const caption = buildReturnedMediaCaption({
+      fileName: entries[0]?.name || `${stem}_01`,
+      sourceUrl: firstMeta.source.source_url,
+      sizeBytes: totalSize,
+      metadata: {
+        title: firstMeta.title,
+        display_title: firstMeta.title,
+        description: firstMeta.description,
+        uploader: firstMeta.source.source_title,
+        webpage_url: firstMeta.source.source_url,
+        folder: safeTopic
+      }
+    });
+    const groupRenameId = rememberRenameGroupTarget(entries.map((entry) => entry.relPath), firstMeta.source.source_url);
+    const videoRenameIds = entries
+      .filter((entry) => isVideoFilePath(entry.name))
+      .map((entry) => rememberRenameTarget(entry.relPath, segment?.id || "", -1, firstMeta.source.source_url));
+    const controlsMarkup = downloadGroupMarkup(groupRenameId, videoRenameIds);
+    await saveSession(botContext.DATA_DIR, currentSession);
+    await sendSavedTelegramMediaGroup(token, chatId, entries, caption, controlsMarkup, groupRenameId);
+    await callApi(token, "deleteMessage", { chat_id: chatId, message_id: statusMsg.message_id }).catch(() => null);
+    await deleteTelegramMessages(token, chatId, messages.map((message) => message.message_id));
+    if (!downloadModeOnly && scrape && segment) {
+      await sendOrEditCard(token, currentSession, scrape, segment).catch(() => null);
+    }
+  } catch (error) {
+    await callApi(token, "editMessageText", {
+      chat_id: chatId,
+      message_id: statusMsg.message_id,
+      text: `Не удалось сохранить альбом: ${error.message}`
+    }).catch(() => null);
+  }
+}
+
+function enqueueTelegramMediaGroup(token, message, media) {
+  const groupId = String(message?.media_group_id || "");
+  if (!groupId) return false;
+  const chatId = message.chat.id;
+  const key = `${chatId}:${groupId}`;
+  const existing = telegramMediaGroupBuffers.get(key) || { token, chatId, records: [], timer: null };
+  existing.records.push({ message, media });
+  clearTimeout(existing.timer);
+  existing.timer = setTimeout(() => {
+    telegramMediaGroupBuffers.delete(key);
+    void handleTelegramMediaGroup(token, chatId, existing.records)
+      .catch((error) => console.error(`[bot] media group failed ${key}:`, error.message));
+  }, TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS);
+  telegramMediaGroupBuffers.set(key, existing);
+  return true;
+}
+
 async function handleMediaMessage(token, message, media) {
   const chatId = message.chat.id;
+  if (message.media_group_id && enqueueTelegramMediaGroup(token, message, media)) {
+    return;
+  }
   if (!currentSession.scrapeId || !currentSession.activeSegmentId) {
     if (currentSession.downloadMode) {
       await handleDownloadModeMediaMessage(token, message, media);
@@ -3907,9 +5750,49 @@ async function handleMediaMessage(token, message, media) {
     freshScrape.segments[segIdx].updated_at = new Date().toISOString();
     await botContext.writeScrape(freshScrape);
 
+    if (currentSession.remotionCtx?.awaitField === "background") {
+      const draft = currentSession.remotionCtx.draft;
+      if (draft) {
+        draft.props.background = { image: relPath, dim: 0.62, blur: 0 };
+        currentSession.remotionCtx.awaitField = null;
+        if (currentSession.remotionCtx.promptMessageId) {
+          await callApi(token, "deleteMessage", { chat_id: chatId, message_id: currentSession.remotionCtx.promptMessageId }).catch(() => null);
+          currentSession.remotionCtx.promptMessageId = null;
+        }
+        currentSession.remotionBgPickCtx = null;
+        await saveSession(botContext.DATA_DIR, currentSession);
+        await showRemotionPanel(token, chatId, currentSession.remotionCtx.panelMessageId || null).catch(() => null);
+      }
+    }
+
     const mediaIndex = items.length - 1;
     const renameId = rememberRenameTarget(relPath, seg.id, mediaIndex, source.source_url);
     if (renameId) await saveSession(botContext.DATA_DIR, currentSession);
+    const sentMessage = await sendLocalMedia(token, {
+      chat_id: chatId,
+      caption: buildReturnedMediaCaption({
+        fileName: finalName,
+        sourceUrl: source.source_url,
+        sizeBytes: stats.size,
+        metadata: {
+          title: mediaMeta.title,
+          description: mediaMeta.description,
+          uploader: source.source_title,
+          webpage_url: source.source_url,
+          folder: topic
+        }
+      }),
+      parse_mode: "HTML",
+      reply_markup: renameButtonMarkup(renameId, supportsTimecodeFilePath(relPath) ? [[
+        { text: "\u23F1\uFE0F", callback_data: `sdvg:timecode:${seg.id}:${mediaIndex}` }
+      ]] : [])
+    }, finalPath, finalName).catch((error) => {
+      console.error("[bot] failed to send saved media back:", error.message);
+      return null;
+    });
+    if (sentMessage?.message_id && attachRenameTargetMessage(renameId, chatId, sentMessage.message_id)) {
+      await saveSession(botContext.DATA_DIR, currentSession);
+    }
     // 5. Update status message
     await callApi(token, "editMessageText", {
       chat_id: chatId,
@@ -3920,9 +5803,15 @@ async function handleMediaMessage(token, message, media) {
         { text: "\u23F1\uFE0F", callback_data: `sdvg:timecode:${seg.id}:${mediaIndex}` }
       ]] : [])
     });
+    if (sentMessage?.message_id) {
+      scheduleDeleteTelegramMessages(token, chatId, [statusMsg.message_id]);
+    }
 
     // 6. Refresh the segment card to show the attached file
     await sendOrEditCard(token, currentSession, freshScrape, freshScrape.segments[segIdx]);
+    if (shouldDeleteSourceMediaMessage(media)) {
+      await callApi(token, "deleteMessage", { chat_id: chatId, message_id: message.message_id }).catch(() => null);
+    }
 
   } catch (error) {
     console.error("[bot] error downloading media file:", error);
@@ -3952,6 +5841,43 @@ async function handleTextMessage(token, message) {
     await saveSession(botContext.DATA_DIR, currentSession);
   }
 
+  if (currentSession.findMissingQueryCtx && !text.startsWith("/")) {
+    const inputCtx = currentSession.findMissingQueryCtx;
+    currentSession.findMissingQueryCtx = null;
+    const ctx = currentSession.findMissingCtx;
+    if (inputCtx.promptMessageId) {
+      await callApi(token, "deleteMessage", { chat_id: chatId, message_id: inputCtx.promptMessageId }).catch(() => null);
+    }
+    await callApi(token, "deleteMessage", { chat_id: chatId, message_id: message.message_id }).catch(() => null);
+    if (!ctx?.topics?.length) {
+      await saveSession(botContext.DATA_DIR, currentSession);
+      await callApi(token, "sendMessage", { chat_id: chatId, text: "Find Missing устарел." }).catch(() => null);
+      return;
+    }
+    if (["отмена", "cancel"].includes(text.toLowerCase())) {
+      await saveSession(botContext.DATA_DIR, currentSession);
+      return;
+    }
+    const topicIndex = Math.max(0, Math.min(Number(inputCtx.topicIndex || 0), ctx.topics.length - 1));
+    const current = ctx.topics[topicIndex];
+    const query = cleanupCaptionText(text) || current.topic;
+    current.query = query;
+    try {
+      const scrape = await botContext.readScrape(ctx.scrapeId);
+      current.items = await fetchRssSearchItems(query, scrape, { limit: 6 });
+      currentSession.findMissingCtx = ctx;
+      await saveSession(botContext.DATA_DIR, currentSession);
+      await editFindMissingMessage(token, chatId, inputCtx.messageId, ctx);
+    } catch (error) {
+      await saveSession(botContext.DATA_DIR, currentSession);
+      await callApi(token, "sendMessage", {
+        chat_id: chatId,
+        text: `Не удалось обновить поиск: ${error.message}`
+      }).catch(() => null);
+    }
+    return;
+  }
+
   if (currentSession.trimInputCtx && !text.startsWith("/")) {
     const ctx = currentSession.trimInputCtx;
     const job = currentSession.trimJobs?.[ctx.jobId];
@@ -3965,6 +5891,7 @@ async function handleTextMessage(token, message) {
     if (["отмена", "cancel"].includes(text.toLowerCase())) {
       currentSession.trimInputCtx = null;
       await saveSession(botContext.DATA_DIR, currentSession);
+      await deleteTelegramMessages(token, chatId, [ctx.promptMessageId, message.message_id]);
       await callApi(token, "sendMessage", { chat_id: chatId, text: "Ввод времени отменён." });
       return;
     }
@@ -3979,11 +5906,14 @@ async function handleTextMessage(token, message) {
       return;
     }
     segment[ctx.field] = seconds;
+    job.cleanupMessageIds = [
+      ...(Array.isArray(job.cleanupMessageIds) ? job.cleanupMessageIds : []),
+      ctx.promptMessageId,
+      message.message_id
+    ].filter(Boolean);
     currentSession.trimInputCtx = null;
     await saveSession(botContext.DATA_DIR, currentSession);
-    if (ctx.promptMessageId) {
-      await callApi(token, "deleteMessage", { chat_id: chatId, message_id: ctx.promptMessageId }).catch(() => null);
-    }
+    await scheduleDeleteTelegramMessages(token, chatId, [ctx.promptMessageId, message.message_id]);
     await updateTrimMessage(token, chatId, job).catch(() => null);
     return;
   }
@@ -4016,12 +5946,20 @@ async function handleTextMessage(token, message) {
       if (target.isGroup) {
         const results = await renameMediaGroupEverywhere(target, text);
         await saveSession(botContext.DATA_DIR, currentSession);
+        await updateGroupTelegramMessages(token, chatId, ctx, target, results).catch((error) => {
+          console.error("[rename-group-update] failed:", error.message);
+        });
         await callApi(token, "deleteMessage", { chat_id: chatId, message_id: message.message_id }).catch(() => null);
         return;
       }
       const result = await renameMediaFileEverywhere(target, text);
       const messageUpdated = await updateRenamedTelegramMessage(token, chatId, ctx, target, result).catch(() => false);
       await saveSession(botContext.DATA_DIR, currentSession);
+      if (!messageUpdated) {
+        await sendRenamedMediaBack(token, chatId, target, result, ctx.sourceUrl || target.sourceUrl || "").catch((error) => {
+          console.error("[rename-send-back] failed:", error.message);
+        });
+      }
       await callApi(token, "deleteMessage", { chat_id: chatId, message_id: message.message_id }).catch(() => null);
       if (!messageUpdated && !currentSession.scrapeId) {
         await callApi(token, "sendMessage", {
@@ -4071,7 +6009,12 @@ async function handleTextMessage(token, message) {
       const firstResult = Array.isArray(result) ? result[0] : result;
       const confirmedInFolder = await movedResultsConfirmedInFolder(result, safeTopic);
       if (confirmedInFolder && firstResult) {
-        await updateRenamedTelegramMessage(token, chatId, ctx, target, firstResult, { folderName: safeTopic }).catch(() => false);
+        if (target.isGroup) {
+          await updateGroupTelegramMessages(token, chatId, ctx, target, result, { folderName: safeTopic }).catch(() => false);
+        } else {
+          await updateRenamedTelegramMessage(token, chatId, ctx, target, firstResult, { folderName: safeTopic }).catch(() => false);
+        }
+        await rememberCurrentDownloadTopic(safeTopic).catch(() => false);
       }
       const themes = await listMediaTopicFolders();
       rememberFolderMoveContext(controlMessageId, {
@@ -4170,6 +6113,40 @@ async function handleTextMessage(token, message) {
     }
   }
 
+  if (currentSession.mediaSearchCtx && !text.startsWith("/")) {
+    const ctx = currentSession.mediaSearchCtx;
+    currentSession.mediaSearchCtx = null;
+    if (ctx.promptMessageId) {
+      await callApi(token, "deleteMessage", { chat_id: chatId, message_id: ctx.promptMessageId }).catch(() => null);
+    }
+    await callApi(token, "deleteMessage", { chat_id: chatId, message_id: message.message_id }).catch(() => null);
+    if (text.toLowerCase() === "отмена" || text.toLowerCase() === "cancel") {
+      if (currentSession.mediaPickCtx) {
+        currentSession.mediaPickCtx.query = "";
+        currentSession.mediaPickCtx.files = Array.isArray(currentSession.mediaPickCtx.allFiles) ? currentSession.mediaPickCtx.allFiles : currentSession.mediaPickCtx.files;
+        currentSession.mediaPickCtx.page = 0;
+        await editMediaPickerMessage(token, chatId, 0, ctx.pickerMessageId);
+      } else {
+        await saveSession(botContext.DATA_DIR, currentSession);
+      }
+      return;
+    }
+    if (currentSession.mediaPickCtx) {
+      const allFiles = Array.isArray(currentSession.mediaPickCtx.allFiles)
+        ? currentSession.mediaPickCtx.allFiles
+        : Array.isArray(currentSession.mediaPickCtx.files)
+          ? currentSession.mediaPickCtx.files
+          : [];
+      currentSession.mediaPickCtx.query = text.trim();
+      currentSession.mediaPickCtx.files = filterMediaPickerFiles(allFiles, text);
+      currentSession.mediaPickCtx.page = 0;
+      await editMediaPickerMessage(token, chatId, 0, ctx.pickerMessageId);
+      return;
+    }
+    await saveSession(botContext.DATA_DIR, currentSession);
+    return;
+  }
+
   if (currentSession.remotionCtx?.awaitField && !text.startsWith("/")) {
     const ctx = currentSession.remotionCtx;
     const field = ctx.awaitField;
@@ -4190,7 +6167,8 @@ async function handleTextMessage(token, message) {
       draft.props.date = value;
       draft.props.meta = value;
     } else if (field === "background") {
-      draft.props.background = value ? { image: value, dim: 0.62, blur: 0 } : { dim: 0.7 };
+      const backgroundInput = cleanRemotionDraftAssetInput(value);
+      draft.props.background = backgroundInput ? { image: backgroundInput, dim: 0.62, blur: 0 } : { dim: 0.7 };
     } else if (field === "logo") {
       if (/^https?:\/\//i.test(value) || /\.(png|jpe?g|webp|svg)$/i.test(value) || value.includes("/")) {
         draft.props.logoIcon = value;
@@ -4224,13 +6202,20 @@ async function handleTextMessage(token, message) {
         "• /sdvgmax — режим только /указаний (сегменты со слэшем)",
         "• /screenshotlab — режим только ссылок для скриншотов",
         "• /notion — обновить активный сценарий из Notion",
-        "• /download — качать ссылки в unsorted без SDVG",
+        "• /notion &lt;notion-url&gt; — создать новый сценарий из Notion-ссылки",
+        "• /download — качать ссылки без SDVG в текущую папку",
         "• /app — открыть активный сценарий в веб-приложении",
         "• /remotion — сгенерировать Remotion-карточку",
         "• /xml — скачать XML активного сценария",
+        "• /premierefix — привести имена медиа к Premiere-safe slug",
         "• /figma — список всех тем активного сценария",
         "• /figmamin — только названия тем",
+        "• /trends &lt;запрос&gt; — найти ссылки в UTrends без привязки к сегменту",
+        "• /findmissing — найти материалы для тем сценария, начиная с тем без контента",
         "• /status — показать текущее состояние сессии",
+        "• /voice — выбрать тему активного сценария для озвучки",
+        "• /voice &lt;текст&gt; — озвучить текст клонированным голосом (или ответом на сообщение)",
+        "• /voiceall — озвучить все темы активного сценария, где ещё нет WAV",
         "",
         "💡 Текстовое сообщение при активном сегменте создаёт новый сегмент-указание.",
         "Также вы можете нажать кнопку <b>TG</b> в веб-интерфейсе UContent, чтобы отправить нужный сценарий сюда."
@@ -4304,20 +6289,213 @@ async function handleTextMessage(token, message) {
     return;
   }
 
-  if (text.startsWith("/notion")) {
-    if (!currentSession.scrapeId) {
+  if (text.startsWith("/voiceall")) {
+    const statusMsg = await callApi(token, "sendMessage", {
+      chat_id: chatId,
+      text: "Обновляю сценарий для /voiceall..."
+    }).catch(() => null);
+    try {
+      const scrape = await readFreshVoiceScrape(currentSession.scrapeId || "", {
+        force: true,
+        timeoutMs: Number(process.env.VOICEALL_NOTION_REFRESH_TIMEOUT_MS || 120_000),
+        throwOnRefreshFailure: true
+      });
+      currentSession.scrapeId = scrape.id || currentSession.scrapeId;
+      await saveSession(botContext.DATA_DIR, currentSession);
+      const topics = voiceTopicOptions(scrape);
+      const pending = [];
+      let existingCount = 0;
+      for (const item of topics) {
+        const voiceText = voiceTextForTopic(scrape, item.topic);
+        if (await topicHasSavedVoiceWav(item.topic, voiceText)) {
+          existingCount += 1;
+          continue;
+        }
+        pending.push({ ...item, voiceText });
+      }
+      if (!pending.length) {
+        await callApi(token, statusMsg?.message_id ? "editMessageText" : "sendMessage", {
+          chat_id: chatId,
+          ...(statusMsg?.message_id ? { message_id: statusMsg.message_id } : {}),
+          text: `Для всех тем из актуального сценария уже есть WAV-озвучки.\nТем с текстом: ${topics.length}\nУже есть WAV: ${existingCount}`
+        }).catch(() => null);
+        return;
+      }
+
+      const failed = [];
+      for (let index = 0; index < pending.length; index += 1) {
+        const item = pending[index];
+        await callApi(token, statusMsg?.message_id ? "editMessageText" : "sendMessage", {
+          chat_id: chatId,
+          ...(statusMsg?.message_id ? { message_id: statusMsg.message_id } : {}),
+          text: `Генерирую озвучки: ${index + 1}/${pending.length}\n📁 ${escapeHtml(item.topic)}`,
+          parse_mode: "HTML"
+        }).catch(() => null);
+        const voiceText = item.voiceText || voiceTextForTopic(scrape, item.topic);
+        if (!voiceText) continue;
+        try {
+          await generateAndSendVoice(token, chatId, voiceText, { topic: item.topic, saveTopic: item.topic });
+        } catch (error) {
+          failed.push(`${item.topic}: ${error.message}`);
+        }
+      }
+
+      const summary = [
+        `Готово: обработано тем ${pending.length}.`,
+        `Тем с текстом: ${topics.length}. Уже были WAV: ${existingCount}.`,
+        failed.length ? `Ошибки: ${failed.length}\n${failed.map((line) => `• ${escapeHtml(clipLabel(line, 160))}`).join("\n")}` : "Ошибок нет."
+      ].join("\n");
+      await callApi(token, statusMsg?.message_id ? "editMessageText" : "sendMessage", {
+        chat_id: chatId,
+        ...(statusMsg?.message_id ? { message_id: statusMsg.message_id } : {}),
+        text: summary,
+        parse_mode: "HTML"
+      }).catch(() => null);
+    } catch (error) {
+      await callApi(token, statusMsg?.message_id ? "editMessageText" : "sendMessage", {
+        chat_id: chatId,
+        ...(statusMsg?.message_id ? { message_id: statusMsg.message_id } : {}),
+        text: `Не удалось обновить сценарий для /voiceall: ${error.message}\nПовторите позже или сначала обновите сценарий через /notion.`
+      }).catch(() => null);
+    }
+    return;
+  }
+
+  if (text.startsWith("/voice")) {
+    let targetText = text.replace(/^\/voice(?:@\w+)?\s*/i, "").trim();
+    if (!targetText && message.reply_to_message) {
+      targetText = String(message.reply_to_message.text || message.reply_to_message.caption || "").trim();
+    }
+    if (!targetText) {
+      const statusMsg = await callApi(token, "sendMessage", {
+        chat_id: chatId,
+        text: "Обновляю сценарий для /voice..."
+      }).catch(() => null);
+      try {
+        const scrape = await readFreshVoiceScrape(currentSession.scrapeId || "");
+        currentSession.scrapeId = scrape.id || currentSession.scrapeId;
+        const topics = voiceTopicOptions(scrape);
+        if (!topics.length) {
+          await callApi(token, statusMsg?.message_id ? "editMessageText" : "sendMessage", {
+            chat_id: chatId,
+            ...(statusMsg?.message_id ? { message_id: statusMsg.message_id } : {}),
+            text: "В актуальном сценарии нет тем с текстом для озвучки после очистки ссылок и строк со слэшем."
+          });
+          return;
+        }
+        const sent = await callApi(token, statusMsg?.message_id ? "editMessageText" : "sendMessage", {
+          chat_id: chatId,
+          ...(statusMsg?.message_id ? { message_id: statusMsg.message_id } : {}),
+          text: `Выберите тему для озвучки из сценария:\n<b>${escapeHtml(scrape.title || scrape.id || "актуальный сценарий")}</b>`,
+          parse_mode: "HTML",
+          reply_markup: voiceTopicKeyboard(topics, 0)
+        });
+        currentSession.voiceTopicCtx = {
+          scrapeId: scrape.id,
+          messageId: sent?.message_id ?? null,
+          topics: topics.map((item) => item.topic),
+          createdAt: new Date().toISOString()
+        };
+        await saveSession(botContext.DATA_DIR, currentSession);
+      } catch (error) {
+        await callApi(token, statusMsg?.message_id ? "editMessageText" : "sendMessage", {
+          chat_id: chatId,
+          ...(statusMsg?.message_id ? { message_id: statusMsg.message_id } : {}),
+          text: `Не удалось открыть список тем для /voice: ${error.message}`
+        }).catch(() => null);
+      }
+      return;
+    }
+    await generateAndSendVoice(token, chatId, targetText).catch(() => null);
+    return;
+  }
+
+  if (text.startsWith("/trends")) {
+    const query = text.replace(/^\/trends(?:@\w+)?\s*/i, "").trim();
+    if (!query) {
       await callApi(token, "sendMessage", {
         chat_id: chatId,
-        text: "Нет активного сценария. Сначала открой /sdvg или нажми TG в веб-интерфейсе."
+        text: "Напишите запрос после /trends, например: <code>/trends первое золото</code>",
+        parse_mode: "HTML"
       });
       return;
     }
+    await runTelegramSearch(token, chatId, query);
+    return;
+  }
+
+  if (text.startsWith("/findmissing")) {
+    const scrapeId = text.replace(/^\/findmissing(?:@\w+)?\s*/i, "").trim();
+    await sendFindMissing(token, chatId, scrapeId);
+    return;
+  }
+
+  if (text.startsWith("/notion")) {
+    const requestedValue = text.replace(/^\/notion(?:@\w+)?\s*/i, "").trim();
+    const notionUrl = extractFirstUrl(requestedValue) || (/^https?:\/\//i.test(requestedValue) ? requestedValue : "");
+    const isNotionUrl = (() => {
+      try {
+        return Boolean(notionUrl && /(^|\.)notion\.(site|so)$/i.test(new URL(notionUrl).hostname));
+      } catch {
+        return false;
+      }
+    })();
+    if (isNotionUrl) {
+      const statusMsg = await callApi(token, "sendMessage", {
+        chat_id: chatId,
+        text: "Scraping Notion..."
+      });
+      try {
+        const response = await fetch(`${UCONTENT_SELF_URL}/api/scrape`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ url: notionUrl })
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        const scrape = data.scrape;
+        if (!scrape?.id) throw new Error("Scrape API did not return scenario");
+        currentSession.scrapeId = scrape.id;
+        currentSession.messageId = null;
+        currentSession.downloadMode = false;
+        currentSession.sdvgMaxMode = false;
+        currentSession.screenshotLabMode = false;
+        currentSession.sdvgActive = true;
+        setNotionBaseline(currentSession, scrape);
+        const nextSegment = findNextSegment(scrape, null, currentSession.randomMode, false, false);
+        currentSession.activeSegmentId = nextSegment?.id || null;
+        await saveSession(botContext.DATA_DIR, currentSession);
+        await callApi(token, "editMessageText", {
+          chat_id: chatId,
+          message_id: statusMsg.message_id,
+          text: `Notion scraped: ${scrape.title || scrape.id}\nID: ${scrape.id}\nLines: ${String(scrape.content ?? "").split(/\r?\n/).length}\nSegments: ${(scrape.segments || []).length}`
+        }).catch(() => null);
+        if (nextSegment) {
+          await sendOrEditCard(token, currentSession, scrape, nextSegment);
+        }
+      } catch (error) {
+        await callApi(token, "editMessageText", {
+          chat_id: chatId,
+          message_id: statusMsg.message_id,
+          text: `Notion scrape failed: ${error.message}`
+        }).catch(() => null);
+      }
+      return;
+    }
+
     const statusMsg = await callApi(token, "sendMessage", {
       chat_id: chatId,
       text: "Refreshing Notion..."
     });
     try {
-      const result = await botContext.refreshScrapeFromNotion(currentSession.scrapeId);
+      const requestedScrapeId = requestedValue || "";
+      const activeScrapeId = currentSession.sdvgActive && currentSession.scrapeId ? currentSession.scrapeId : "";
+      let scrapeId = requestedScrapeId || activeScrapeId;
+      if (!scrapeId) {
+        const latestScrape = await botContext.readScrape("");
+        scrapeId = latestScrape.id;
+      }
+      const result = await botContext.refreshScrapeFromNotion(scrapeId);
       const scrape = result.scrape;
       const activeStillExists = (scrape.segments || []).some((segment) => segment.id === currentSession.activeSegmentId);
       const nextSegment = activeStillExists
@@ -4350,12 +6528,55 @@ async function handleTextMessage(token, message) {
   }
 
   if (text.startsWith("/figmamin")) {
-    await sendActiveScrapeFigmaThemes(token, chatId, true);
+    const scrapeId = text.split(/\s+/)[1] || "";
+    await sendActiveScrapeFigmaThemes(token, chatId, true, scrapeId);
     return;
   }
 
   if (text.startsWith("/figma")) {
-    await sendActiveScrapeFigmaThemes(token, chatId);
+    const scrapeId = text.split(/\s+/)[1] || "";
+    await sendActiveScrapeFigmaThemes(token, chatId, false, scrapeId);
+    return;
+  }
+
+  if (text.startsWith("/premierefix")) {
+    const statusMsg = await callApi(token, "sendMessage", {
+      chat_id: chatId,
+      text: "Проверяю имена медиа для Premiere..."
+    });
+    try {
+      const requestedScrapeId = text.split(/\s+/)[1] || "";
+      const activeScrapeId = currentSession.sdvgActive && currentSession.scrapeId ? currentSession.scrapeId : "";
+      let scrapeId = requestedScrapeId || activeScrapeId;
+      if (!scrapeId) {
+        const latestScrape = await botContext.readScrape("");
+        scrapeId = latestScrape.id;
+      }
+      const previousScrapeId = currentSession.scrapeId;
+      currentSession.scrapeId = scrapeId;
+      const scrape = await botContext.readScrape(scrapeId);
+      const changed = await normalizeScrapeMediaFileNamesForPremiere(scrape);
+      if (!currentSession.sdvgActive && !requestedScrapeId) {
+        currentSession.scrapeId = scrapeId;
+      } else if (!currentSession.sdvgActive) {
+        currentSession.scrapeId = previousScrapeId;
+      }
+      await saveSession(botContext.DATA_DIR, currentSession);
+      const preview = changed.slice(0, 12).map((item) => `${item.oldName} -> ${item.newName}`).join("\n");
+      await callApi(token, "editMessageText", {
+        chat_id: chatId,
+        message_id: statusMsg.message_id,
+        text: changed.length
+          ? `Premiere-safe имена обновлены: ${changed.length}\n${preview}${changed.length > 12 ? "\n..." : ""}`
+          : "Все привязанные медиа уже в Premiere-safe формате."
+      }).catch(() => null);
+    } catch (error) {
+      await callApi(token, "editMessageText", {
+        chat_id: chatId,
+        message_id: statusMsg.message_id,
+        text: `Не удалось привести имена для Premiere: ${error.message}`
+      }).catch(() => null);
+    }
     return;
   }
 
@@ -4374,7 +6595,7 @@ async function handleTextMessage(token, message) {
     await callApi(token, "sendMessage", {
       chat_id: chatId,
       text: enable
-        ? "Режим скачивания включен. Присылайте ссылки: я скачаю их в unsorted и отправлю файлы обратно."
+        ? "Режим скачивания включен. Присылайте ссылки: я скачаю их в текущую папку, а если она не выбрана или удалена — в unsorted."
         : "Режим скачивания выключен."
     });
     return;
@@ -4479,9 +6700,9 @@ async function handleTextMessage(token, message) {
       if (segmentIndex >= 0) {
         const segment = scrape.segments[segmentIndex];
         if (isVkDownloadUrl(downloadUrl) || isYtDlpCandidateUrl(downloadUrl)) {
-          await processDownload(token, chatId, scrape, segment, segmentIndex, downloadUrl);
+          await processDownload(token, chatId, scrape, segment, segmentIndex, downloadUrl, message.message_id);
         } else {
-          await startScreenshotPreview(token, chatId, scrape, segment, segmentIndex, url);
+          await sendPagePreviewForSegment(token, chatId, scrape, segment, segmentIndex, url, message.message_id);
         }
       }
     } catch (error) {
@@ -4553,8 +6774,8 @@ async function handleCallbackQuery(token, callbackQuery) {
     await saveSession(botContext.DATA_DIR, currentSession);
   }
 
-  // Acknowledge callback query (skipped for sdvg:shot:* which answer themselves)
-  if (!data.startsWith("sdvg:shot:")) {
+  // Acknowledge callback query (skipped for handlers which answer themselves)
+  if (!data.startsWith("sdvg:shot:") && !data.startsWith("sdvg:voice:") && !data.startsWith("sdvg:preview:")) {
     await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId }).catch(() => null);
   }
 
@@ -4572,11 +6793,159 @@ async function handleCallbackQuery(token, callbackQuery) {
   }
 
   if (data === "sdvg:clear_buttons") {
+    const groupTarget = (currentSession.renameTargets || []).find((item) =>
+      item?.isGroup && Number(item?.messageId || 0) === Number(callbackMessageId)
+    );
+    if (groupTarget) {
+      groupTarget.messageId = null;
+      groupTarget.chatId = null;
+      await saveSession(botContext.DATA_DIR, currentSession);
+      await callApi(token, "deleteMessage", {
+        chat_id: chatId,
+        message_id: callbackMessageId
+      }).catch(() => null);
+      await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId }).catch(() => null);
+      return;
+    }
     await callApi(token, "editMessageReplyMarkup", {
       chat_id: chatId,
       message_id: callbackMessageId,
       reply_markup: { inline_keyboard: [] }
     }).catch(() => null);
+    await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId }).catch(() => null);
+    return;
+  }
+
+  if (data.startsWith("sdvg:preview:")) {
+    const action = data.slice("sdvg:preview:".length);
+    const ctx = findPagePreviewContext(callbackMessageId);
+    if (action === "close") {
+      if (ctx?.messageId && Number(ctx.messageId) === Number(callbackMessageId)) {
+        currentSession.pagePreviewTargets = (currentSession.pagePreviewTargets || [])
+          .filter((item) => Number(item?.messageId || 0) !== Number(callbackMessageId));
+        if (Number(currentSession.pagePreviewCtx?.messageId || 0) === Number(callbackMessageId)) {
+          currentSession.pagePreviewCtx = null;
+        }
+        await saveSession(botContext.DATA_DIR, currentSession);
+      }
+      await callApi(token, "deleteMessage", { chat_id: chatId, message_id: callbackMessageId }).catch(() => null);
+      await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId }).catch(() => null);
+      return;
+    }
+    if (action === "screenshot") {
+      if (!ctx?.url) {
+        await callApi(token, "answerCallbackQuery", {
+          callback_query_id: callbackId,
+          text: "Превью устарело.",
+          show_alert: true
+        }).catch(() => null);
+        return;
+      }
+      await callApi(token, "answerCallbackQuery", {
+        callback_query_id: callbackId,
+        text: "Открываю настройки скриншота..."
+      }).catch(() => null);
+      if (ctx.standalone || !ctx.scrapeId || !ctx.segmentId) {
+        await startStandaloneScreenshotPreview(token, chatId, ctx.url, ctx.sourceMessageId, { saveLinkPreviewImage: false });
+        return;
+      }
+      const previewScrape = await botContext.readScrape(ctx.scrapeId).catch(() => null);
+      const previewSegmentIndex = (previewScrape?.segments || []).findIndex((item) => item.id === ctx.segmentId);
+      if (!previewScrape || previewSegmentIndex < 0) {
+        await callApi(token, "sendMessage", { chat_id: chatId, text: "Сегмент для скриншота больше не найден." }).catch(() => null);
+        return;
+      }
+      await startScreenshotPreview(
+        token,
+        chatId,
+        previewScrape,
+        previewScrape.segments[previewSegmentIndex],
+        previewSegmentIndex,
+        ctx.url,
+        { saveLinkPreviewImage: false }
+      );
+      return;
+    }
+    await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId }).catch(() => null);
+    return;
+  }
+
+  if (data.startsWith("sdvg:voice:")) {
+    const action = data.slice("sdvg:voice:".length);
+    if (action === "noop") {
+      await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId }).catch(() => null);
+      return;
+    }
+    if (action === "close") {
+      await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId }).catch(() => null);
+      currentSession.voiceTopicCtx = null;
+      await saveSession(botContext.DATA_DIR, currentSession);
+      await callApi(token, "deleteMessage", { chat_id: chatId, message_id: callbackMessageId }).catch(() => null);
+      return;
+    }
+
+    const ctx = currentSession.voiceTopicCtx || {};
+    const scrapeId = ctx.scrapeId || currentSession.scrapeId || "";
+    let scrape = null;
+    try {
+      scrape = await readFreshVoiceScrape(scrapeId);
+      currentSession.scrapeId = scrape.id || currentSession.scrapeId;
+    } catch (error) {
+      await callApi(token, "answerCallbackQuery", {
+        callback_query_id: callbackId,
+        text: `Не удалось загрузить сценарий: ${error.message}`,
+        show_alert: true
+      }).catch(() => null);
+      return;
+    }
+
+    const topics = voiceTopicOptions(scrape);
+    if (action.startsWith("page:")) {
+      await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId }).catch(() => null);
+      const page = Math.max(0, Number.parseInt(action.slice("page:".length), 10) || 0);
+      await callApi(token, "editMessageReplyMarkup", {
+        chat_id: chatId,
+        message_id: callbackMessageId,
+        reply_markup: voiceTopicKeyboard(topics, page)
+      }).catch(() => null);
+      currentSession.voiceTopicCtx = {
+        ...ctx,
+        scrapeId: scrape.id,
+        messageId: callbackMessageId,
+        topics: topics.map((item) => item.topic)
+      };
+      await saveSession(botContext.DATA_DIR, currentSession);
+      return;
+    }
+
+    if (action.startsWith("topic:")) {
+      const index = Number.parseInt(action.slice("topic:".length), 10);
+      const topic = topics[index]?.topic || ctx.topics?.[index] || "";
+      if (!topic) {
+        await callApi(token, "answerCallbackQuery", {
+          callback_query_id: callbackId,
+          text: "Тема больше не найдена.",
+          show_alert: true
+        }).catch(() => null);
+        return;
+      }
+      const voiceText = voiceTextForTopic(scrape, topic);
+      if (!voiceText) {
+        await callApi(token, "answerCallbackQuery", {
+          callback_query_id: callbackId,
+          text: "После очистки в теме не осталось текста для озвучки.",
+          show_alert: true
+        }).catch(() => null);
+        return;
+      }
+      await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId, text: "Генерирую озвучку..." }).catch(() => null);
+      currentSession.voiceTopicCtx = null;
+      await saveSession(botContext.DATA_DIR, currentSession);
+      await callApi(token, "deleteMessage", { chat_id: chatId, message_id: callbackMessageId }).catch(() => null);
+      await generateAndSendVoice(token, chatId, voiceText, { topic, saveTopic: topic }).catch(() => null);
+      return;
+    }
+
     return;
   }
 
@@ -4611,16 +6980,22 @@ async function handleCallbackQuery(token, callbackQuery) {
   if (data.startsWith("sdvg:remotion:")) {
     const action = data.slice("sdvg:remotion:".length);
     const ctx = currentSession.remotionCtx || null;
-    if (action.startsWith("font:")) {
-      const [, renderId, direction] = action.match(/^font:([^:]+):([+-])$/) || [];
+    if (action === "noop") return;
+    if (action.startsWith("font:") || action.startsWith("line:")) {
+      const [, kind, renderId, direction] = action.match(/^(font|line):([^:]+):([+-])$/) || [];
       const target = (currentSession.remotionRenders || []).find((item) => item?.id === renderId);
       if (!target?.body) {
-        await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId, text: "Рендер устарел.", show_alert: true }).catch(() => null);
+        await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId, text: "Render expired.", show_alert: true }).catch(() => null);
         return;
       }
       const nextBody = JSON.parse(JSON.stringify(target.body));
-      const currentScale = Number(nextBody.props?.textScale || 1) || 1;
-      nextBody.props.textScale = Math.max(0.72, Math.min(1.38, currentScale + (direction === "+" ? 0.08 : -0.08)));
+      if (kind === "line") {
+        const currentScale = Number(nextBody.props?.lineHeightScale || 1) || 1;
+        nextBody.props.lineHeightScale = Math.max(0.72, Math.min(1.5, currentScale + (direction === "+" ? 0.08 : -0.08)));
+      } else {
+        const currentScale = Number(nextBody.props?.textScale || 1) || 1;
+        nextBody.props.textScale = Math.max(0.72, Math.min(1.38, currentScale + (direction === "+" ? 0.08 : -0.08)));
+      }
       await renderTelegramRemotionBody(token, chatId, nextBody).catch(() => null);
       return;
     }
@@ -4629,6 +7004,21 @@ async function handleCallbackQuery(token, callbackQuery) {
       return;
     }
     const draft = ctx.draft;
+    if (action.startsWith("draftfont:") || action.startsWith("draftline:")) {
+      const isLine = action.startsWith("draftline:");
+      const direction = action.slice(isLine ? "draftline:".length : "draftfont:".length);
+      if (!["+", "-"].includes(direction)) return;
+      if (isLine) {
+        const currentScale = Number(draft.props?.lineHeightScale || 1) || 1;
+        draft.props.lineHeightScale = Math.max(0.72, Math.min(1.5, currentScale + (direction === "+" ? 0.08 : -0.08)));
+      } else {
+        const currentScale = Number(draft.props?.textScale || 1) || 1;
+        draft.props.textScale = Math.max(0.72, Math.min(1.38, currentScale + (direction === "+" ? 0.08 : -0.08)));
+      }
+      currentSession.remotionCtx = { ...ctx, draft, panelMessageId: callbackMessageId };
+      await showRemotionPanel(token, chatId, callbackMessageId);
+      return;
+    }
     if (action === "close") {
       currentSession.remotionCtx = null;
       await saveSession(botContext.DATA_DIR, currentSession);
@@ -4645,6 +7035,10 @@ async function handleCallbackQuery(token, callbackQuery) {
     }
     if (action.startsWith("field:")) {
       const field = action.slice("field:".length);
+      if (field === "background") {
+        await showRemotionBackgroundPicker(token, chatId, 0, callbackMessageId);
+        return;
+      }
       const previousPrompt = ctx.promptMessageId;
       if (previousPrompt) await callApi(token, "deleteMessage", { chat_id: chatId, message_id: previousPrompt }).catch(() => null);
       const prompt = await callApi(token, "sendMessage", {
@@ -4653,6 +7047,16 @@ async function handleCallbackQuery(token, callbackQuery) {
       }).catch(() => null);
       currentSession.remotionCtx = { ...ctx, awaitField: field, promptMessageId: prompt?.message_id || null, panelMessageId: callbackMessageId };
       await saveSession(botContext.DATA_DIR, currentSession);
+      return;
+    }
+    if (action.startsWith("type:")) {
+      const type = action.slice("type:".length);
+      const safeType = ["quote", "news"].includes(type) ? type : "quote";
+      const parts = remotionFormatParts(draft.format);
+      draft.format = remotionFormatFromParts({ ...parts, type: safeType });
+      draft.props.type = safeType;
+      currentSession.remotionCtx = { ...ctx, draft, panelMessageId: callbackMessageId };
+      await showRemotionPanel(token, chatId, callbackMessageId);
       return;
     }
     if (action.startsWith("shape:")) {
@@ -4701,6 +7105,36 @@ async function handleCallbackQuery(token, callbackQuery) {
       draft.logoChoices = [];
       currentSession.remotionCtx = { ...ctx, draft, panelMessageId: callbackMessageId };
       await showRemotionPanel(token, chatId, callbackMessageId);
+      return;
+    }
+    if (action.startsWith("bg:")) {
+      const bgAction = action.slice("bg:".length);
+      if (bgAction === "noop") return;
+      if (bgAction === "clear") {
+        draft.props.background = { dim: 0.7 };
+        currentSession.remotionBgPickCtx = null;
+        if (currentSession.remotionCtx) currentSession.remotionCtx.awaitField = null;
+        await saveSession(botContext.DATA_DIR, currentSession);
+        await showRemotionPanel(token, chatId, callbackMessageId);
+        return;
+      }
+      if (bgAction === "back") {
+        currentSession.remotionBgPickCtx = null;
+        if (currentSession.remotionCtx) currentSession.remotionCtx.awaitField = null;
+        await saveSession(botContext.DATA_DIR, currentSession);
+        await showRemotionPanel(token, chatId, callbackMessageId);
+        return;
+      }
+      if (bgAction.startsWith("page:")) {
+        const page = Math.max(0, Number.parseInt(bgAction.slice("page:".length), 10) || 0);
+        await showRemotionBackgroundPicker(token, chatId, page, callbackMessageId);
+        return;
+      }
+      if (bgAction.startsWith("sel:")) {
+        const index = Number.parseInt(bgAction.slice("sel:".length), 10);
+        await selectRemotionBackground(token, chatId, index, callbackMessageId);
+        return;
+      }
       return;
     }
   }
@@ -4848,7 +7282,12 @@ async function handleCallbackQuery(token, callbackQuery) {
         const firstResult = Array.isArray(result) ? result[0] : result;
         const confirmedInFolder = await movedResultsConfirmedInFolder(result, selectedTheme);
         if (confirmedInFolder && firstResult) {
-          await updateRenamedTelegramMessage(token, chatId, { messageId: callbackMessageId, chatId }, target, firstResult, { folderName: selectedTheme }).catch(() => false);
+          if (target.isGroup) {
+            await updateGroupTelegramMessages(token, chatId, { messageId: callbackMessageId, chatId }, target, result, { folderName: selectedTheme }).catch(() => false);
+          } else {
+            await updateRenamedTelegramMessage(token, chatId, { messageId: callbackMessageId, chatId }, target, firstResult, { folderName: selectedTheme }).catch(() => false);
+          }
+          await rememberCurrentDownloadTopic(selectedTheme).catch(() => false);
         }
         const nextContext = {
           ...context,
@@ -4873,6 +7312,38 @@ async function handleCallbackQuery(token, callbackQuery) {
       }).catch(() => null);
       return;
     }
+  }
+
+  if (data.startsWith("sdvg:delete:")) {
+    const targetId = data.slice("sdvg:delete:".length);
+    const target = (currentSession.renameTargets || []).find((item) => item?.id === targetId);
+    if (!target) {
+      await callApi(token, "answerCallbackQuery", { callback_query_id: callbackId, text: "Файл больше не найден.", show_alert: true }).catch(() => null);
+      return;
+    }
+    try {
+      const result = await deleteMediaTargetEverywhere(target);
+      await saveSession(botContext.DATA_DIR, currentSession);
+      await callApi(token, "deleteMessage", { chat_id: chatId, message_id: callbackMessageId }).catch(() => null);
+      await callApi(token, "answerCallbackQuery", {
+        callback_query_id: callbackId,
+        text: result.relPaths?.length > 1
+          ? `Удалено файлов: ${result.relPaths.length}`
+          : `Удалено: ${path.basename(result.relPath)}`
+      }).catch(() => null);
+      if (currentSession.scrapeId && currentSession.activeSegmentId) {
+        const freshScrape = await botContext.readScrape(currentSession.scrapeId).catch(() => null);
+        const seg = freshScrape?.segments?.find((segment) => segment.id === currentSession.activeSegmentId);
+        if (freshScrape && seg) await sendOrEditCard(token, currentSession, freshScrape, seg).catch(() => null);
+      }
+    } catch (error) {
+      await callApi(token, "answerCallbackQuery", {
+        callback_query_id: callbackId,
+        text: clipLabel(`Не удалось удалить файл: ${error.message}`, 180),
+        show_alert: true
+      }).catch(() => null);
+    }
+    return;
   }
 
   if (data.startsWith("sdvg:trim:start:")) {
@@ -4951,26 +7422,34 @@ async function handleCallbackQuery(token, callbackQuery) {
       const stats = await fs.stat(outputPath);
       const outputName = path.basename(outputPath);
       const outputRelPath = mediaRelPathFromAbsolute(outputPath);
+      const sourceUrl = await sourceUrlForMediaRelPath(job.relPath, job.sourceUrl);
+      const parentMetadata = await botContext.getMediaMetadata?.(job.relPath).catch(() => null);
       await botContext.upsertMediaMetadata?.(outputRelPath, {
+        ...metadataFromMediaItem(parentMetadata || {}),
         derivation: "trim",
-        source_url: job.sourceUrl,
+        source_url: sourceUrl,
+        webpage_url: sourceUrl,
         parent_path: job.relPath,
         size: stats.size
       });
       await archiveParentMediaFile(job.relPath);
-      const renameId = rememberRenameTarget(outputRelPath, "", -1, job.sourceUrl);
+      const renameId = rememberRenameTarget(outputRelPath, "", -1, sourceUrl);
       await saveSession(botContext.DATA_DIR, currentSession);
       const sentMessage = await sendLocalMedia(token, {
         chat_id: chatId,
         caption: buildReturnedMediaCaption({
           fileName: outputName,
-          sourceUrl: job.sourceUrl,
+          sourceUrl,
           sizeBytes: stats.size,
-          metadata: { webpage_url: job.sourceUrl }
+          metadata: {
+            ...metadataFromMediaItem(parentMetadata || {}),
+            webpage_url: sourceUrl,
+            source_url: sourceUrl
+          }
         }),
         parse_mode: "HTML",
         reply_markup: renameButtonMarkup(renameId)
-      }, outputPath, safeSendFileNameFromMetadata(outputName, job.sourceUrl, { webpage_url: job.sourceUrl }, "cut"));
+      }, outputPath, outputName);
       if (sentMessage?.message_id && attachRenameTargetMessage(renameId, chatId, sentMessage.message_id)) {
         await saveSession(botContext.DATA_DIR, currentSession);
       }
@@ -5036,26 +7515,34 @@ async function handleCallbackQuery(token, callbackQuery) {
       const stats = await fs.stat(outputPath).catch(() => null);
       const sendName = path.basename(outputPath);
       const outputRelPath = mediaRelPathFromAbsolute(outputPath);
+      const sourceUrl = await sourceUrlForMediaRelPath(cut.relPath, cut.sourceUrl);
+      const parentMetadata = await botContext.getMediaMetadata?.(cut.relPath).catch(() => null);
       await botContext.upsertMediaMetadata?.(outputRelPath, {
+        ...metadataFromMediaItem(parentMetadata || {}),
         derivation: "video_cutter",
-        source_url: cut.sourceUrl,
+        source_url: sourceUrl,
+        webpage_url: sourceUrl,
         parent_path: cut.relPath,
         size: stats?.size || 0
       });
       await archiveParentMediaFile(cut.relPath);
-      const renameId = rememberRenameTarget(outputRelPath, "", -1, cut.sourceUrl);
+      const renameId = rememberRenameTarget(outputRelPath, "", -1, sourceUrl);
       await saveSession(botContext.DATA_DIR, currentSession);
       const sentMessage = await sendLocalMedia(token, {
         chat_id: chatId,
         caption: buildReturnedMediaCaption({
           fileName: sendName,
-          sourceUrl: cut.sourceUrl,
+          sourceUrl,
           sizeBytes: stats?.size || 0,
-          metadata: { webpage_url: cut.sourceUrl }
+          metadata: {
+            ...metadataFromMediaItem(parentMetadata || {}),
+            webpage_url: sourceUrl,
+            source_url: sourceUrl
+          }
         }),
         parse_mode: "HTML",
         reply_markup: renameButtonMarkup(renameId)
-      }, outputPath, safeSendFileNameFromMetadata(sendName, cut.sourceUrl, { webpage_url: cut.sourceUrl }, "cut"));
+      }, outputPath, safeSendFileNameFromMetadata(sendName, sourceUrl, { webpage_url: sourceUrl }, "cut"));
       if (sentMessage?.message_id && attachRenameTargetMessage(renameId, chatId, sentMessage.message_id)) {
         await saveSession(botContext.DATA_DIR, currentSession);
       }
@@ -5205,7 +7692,32 @@ async function handleCallbackQuery(token, callbackQuery) {
     return;
   }
 
-  if (!currentSession.scrapeId || !currentSession.activeSegmentId) {
+  if (data.startsWith("sdvg:missing:")) {
+    await handleFindMissingCallback(token, chatId, data, callbackMessageId, callbackQueryId);
+    return;
+  }
+
+  if (data.startsWith("sdvg:search:add:")) {
+    const resultIndex = Number(data.split(":")[3] || "-1");
+    await addSearchResultToScrape(token, chatId, resultIndex, callbackMessageId);
+    return;
+  }
+
+  if (data.startsWith("sdvg:search:drop:")) {
+    const resultIndex = Number(data.split(":")[3] || "-1");
+    await dropSearchResult(token, chatId, resultIndex, callbackMessageId);
+    return;
+  }
+
+  if (data === "sdvg:search:close") {
+    currentSession.searchCtx = null;
+    await saveSession(botContext.DATA_DIR, currentSession);
+    await callApi(token, "deleteMessage", { chat_id: chatId, message_id: callbackMessageId }).catch(() => null);
+    return;
+  }
+
+  const isShotCallback = data.startsWith("sdvg:shot:");
+  if (!isShotCallback && (!currentSession.scrapeId || !currentSession.activeSegmentId)) {
     await callApi(token, "sendMessage", {
       chat_id: chatId,
       text: "\u041D\u0435\u0442 \u0430\u043A\u0442\u0438\u0432\u043D\u043E\u0433\u043E \u0441\u0435\u0433\u043C\u0435\u043D\u0442\u0430. \u0418\u0441\u043F\u043E\u043B\u044C\u0437\u0443\u0439\u0442\u0435 \u043A\u043E\u043C\u0430\u043D\u0434\u0443 /sdvg."
@@ -5214,19 +7726,21 @@ async function handleCallbackQuery(token, callbackQuery) {
   }
 
   let scrape, segmentIndex, segment;
-  try {
-    scrape = await botContext.readScrape(currentSession.scrapeId);
-    segmentIndex = (scrape.segments || []).findIndex((s) => s.id === currentSession.activeSegmentId);
-    if (segmentIndex < 0) {
-      throw new Error("Сегмент не найден");
+  if (!isShotCallback) {
+    try {
+      scrape = await botContext.readScrape(currentSession.scrapeId);
+      segmentIndex = (scrape.segments || []).findIndex((s) => s.id === currentSession.activeSegmentId);
+      if (segmentIndex < 0) {
+        throw new Error("Сегмент не найден");
+      }
+      segment = scrape.segments[segmentIndex];
+    } catch (error) {
+      await callApi(token, "sendMessage", {
+        chat_id: chatId,
+        text: `Ошибка загрузки сегмента: ${error.message}`
+      });
+      return;
     }
-    segment = scrape.segments[segmentIndex];
-  } catch (error) {
-    await callApi(token, "sendMessage", {
-      chat_id: chatId,
-      text: `Ошибка загрузки сегмента: ${error.message}`
-    });
-    return;
   }
 
   if (data === "sdvg:media:open") {
@@ -5236,7 +7750,7 @@ async function handleCallbackQuery(token, callbackQuery) {
 
   if (data.startsWith("sdvg:media:page:")) {
     const page = Number(data.split(":")[3] || "0");
-    await showMediaPicker(token, chatId, scrape, segment, page, callbackMessageId);
+    await editMediaPickerMessage(token, chatId, page, callbackMessageId);
     return;
   }
 
@@ -5248,8 +7762,23 @@ async function handleCallbackQuery(token, callbackQuery) {
 
   if (data === "sdvg:media:close") {
     currentSession.mediaPickCtx = null;
+    currentSession.mediaSearchCtx = null;
     await saveSession(botContext.DATA_DIR, currentSession);
     await callApi(token, "deleteMessage", { chat_id: chatId, message_id: callbackMessageId }).catch(() => null);
+    return;
+  }
+
+  if (data === "sdvg:media:search") {
+    const promptMsg = await callApi(token, "sendMessage", {
+      chat_id: chatId,
+      text: "Введите быстрый поиск по файлам. Отправьте <code>отмена</code>, чтобы сбросить фильтр.",
+      parse_mode: "HTML"
+    });
+    currentSession.mediaSearchCtx = {
+      pickerMessageId: callbackMessageId,
+      promptMessageId: promptMsg?.message_id ?? null
+    };
+    await saveSession(botContext.DATA_DIR, currentSession);
     return;
   }
 
@@ -5323,12 +7852,12 @@ async function handleCallbackQuery(token, callbackQuery) {
     await botContext.writeScrape(scrape);
     const refreshedSegment = scrape.segments[segmentIndex];
     const refreshedHasLink = refreshedSegment.type === "link" || !!extractFirstUrl(refreshedSegment.text);
-    const refreshedDownloadState = await getSegmentDownloadState(refreshedSegment).catch(() => ({
+    const refreshedLinkState = {
       url: extractFirstUrl(refreshedSegment?.text || ""),
       downloadable: false,
-      alreadyDownloaded: false
-    }));
-    const refreshedLinkState = { ...refreshedDownloadState, hasLink: refreshedHasLink };
+      alreadyDownloaded: false,
+      hasLink: refreshedHasLink
+    };
     await callApi(token, "editMessageText", {
       chat_id: chatId,
       message_id: currentSession.messageId,
@@ -5398,9 +7927,10 @@ async function handleCallbackQuery(token, callbackQuery) {
       return;
     }
 
-    const freshScrape = await botContext.readScrape(ctx.scrapeId);
-    const seg = freshScrape.segments.find(s => s.id === ctx.segmentId);
-    const safeTopic = botContext.sanitizeMediaTopicName((seg?.topic) || "unsorted");
+    const standaloneShot = Boolean(ctx.standalone || !ctx.scrapeId || !ctx.segmentId);
+    const freshScrapeForShot = standaloneShot ? null : await botContext.readScrape(ctx.scrapeId);
+    const seg = freshScrapeForShot?.segments?.find(s => s.id === ctx.segmentId);
+    const safeTopic = botContext.sanitizeMediaTopicName((standaloneShot ? ctx.topic : seg?.topic) || "unsorted");
     const { dir } = await botContext.ensureTopicDir(safeTopic);
 
     if (action === "drop") {
@@ -5494,10 +8024,38 @@ async function handleCallbackQuery(token, callbackQuery) {
         const buf = await captureScreenshot(ctx.url, ctx.profile);
         const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
         const sfx   = Math.random().toString(36).slice(2, 8);
-        const freshScrape = await botContext.readScrape(ctx.scrapeId);
-        const segIdx = freshScrape.segments.findIndex(s => s.id === ctx.segmentId);
+        const freshScrape = standaloneShot ? null : await botContext.readScrape(ctx.scrapeId);
+        const segIdx = freshScrape ? freshScrape.segments.findIndex(s => s.id === ctx.segmentId) : -1;
         
-        if (segIdx !== -1) {
+        if (standaloneShot) {
+          const topic = safeTopic;
+          const { dir: shotDir } = await botContext.ensureTopicDir(topic);
+          const shotName = `shot_${stamp}_${sfx}.png`;
+          const shotPath = path.join(shotDir, shotName);
+          await fs.writeFile(shotPath, buf);
+          const relPath = `${topic}/${shotName}`;
+          const stats = await fs.stat(shotPath);
+          await botContext.upsertMediaMetadata?.(relPath, {
+            derivation: "screenshot",
+            source_url: ctx.url,
+            title: `Скриншот ${hostLabelForFileName(ctx.url)}`,
+            size: stats.size,
+            resolution: `${ctx.profile.width}x${ctx.profile.height}`,
+            format_note: `zoom ${ctx.profile.zoom}, scroll ${ctx.profile.scroll}`
+          }).catch(() => null);
+          const renameId = rememberRenameTarget(relPath, "", -1, ctx.url);
+          await saveSession(botContext.DATA_DIR, currentSession);
+          const sentMessage = await sendLocalMedia(token, {
+            chat_id: chatId,
+            caption: `📸 <b>Скриншот</b>\n${sourceSiteLinkHtml(ctx.url)}\n🖥 ${shotProfileLabel(ctx.profile)}\n📦 ${escapeHtml(formatBytes(stats.size))}\n📁 ${escapeHtml(topic)}`,
+            parse_mode: "HTML",
+            reply_markup: renameButtonMarkup(renameId)
+          }, shotPath, shotName);
+          if (sentMessage?.message_id) {
+            attachRenameTargetMessage(renameId, chatId, sentMessage.message_id);
+            await saveSession(botContext.DATA_DIR, currentSession);
+          }
+        } else if (segIdx !== -1) {
           const seg = freshScrape.segments[segIdx];
           const topic = botContext.sanitizeMediaTopicName((seg.topic) || "unsorted");
           const { dir: shotDir } = await botContext.ensureTopicDir(topic);
@@ -5530,10 +8088,15 @@ async function handleCallbackQuery(token, callbackQuery) {
         }
 
         if (action === "add") {
-          await sendOrEditCard(token, currentSession, freshScrape, freshScrape.segments.find(s => s.id === ctx.segmentId)).catch(() => null);
+          if (freshScrape) {
+            await sendOrEditCard(token, currentSession, freshScrape, freshScrape.segments.find(s => s.id === ctx.segmentId)).catch(() => null);
+          }
           currentSession.shotCtx = null;
           await saveSession(botContext.DATA_DIR, currentSession);
           await callApi(token, "deleteMessage", { chat_id: chatId, message_id: callbackMessageId }).catch(() => null);
+          if (standaloneShot) {
+            scheduleDeleteTelegramMessages(token, chatId, [ctx.sourceMessageId]);
+          }
         } else {
           // retry — keep keyboard, restore panel caption
           await callApi(token, "editMessageCaption", {
@@ -5569,7 +8132,8 @@ export async function triggerWebBroadcast(scrapeId) {
   if (!botRunning || !botContext) {
     throw new Error("Telegram Bot не запущен");
   }
-  const token = process.env.UCONTENT_BOT_TOKEN || process.env.BOT_TOKEN || DEFAULT_TOKEN;
+  const token = process.env.UCONTENT_BOT_TOKEN || process.env.BOT_TOKEN;
+  if (!token) throw new Error("UCONTENT_BOT_TOKEN or BOT_TOKEN is required");
   if (!currentSession.chatId) {
     throw new Error("Нет привязанного чата. Сначала отправьте боту в Telegram команду /start");
   }
@@ -5607,7 +8171,8 @@ export async function startTelegramBot(context) {
   botContext = context;
   botRunning = true;
 
-  const token = process.env.UCONTENT_BOT_TOKEN || process.env.BOT_TOKEN || DEFAULT_TOKEN;
+  const token = process.env.UCONTENT_BOT_TOKEN || process.env.BOT_TOKEN;
+  if (!token) throw new Error("UCONTENT_BOT_TOKEN or BOT_TOKEN is required");
   await loadSession(context.DATA_DIR);
   await saveSession(context.DATA_DIR, currentSession);
   if (currentSession.lastUpdateId > 0) {
@@ -5626,7 +8191,7 @@ export async function startTelegramBot(context) {
     }
   }
 
-  console.log(`[bot] Starting Telegram Bot with token: ${token.slice(0, 12)}...`);
+  console.log("[bot] Starting Telegram Bot");
   console.log(`[notion-auto-refresh] Active SDVG scrape will be checked every ${Math.round(NOTION_REFRESH_INTERVAL_MS / 1000)} seconds`);
   scheduleNotionRefresh(token);
 
@@ -5658,6 +8223,12 @@ export async function startTelegramBot(context) {
               await saveSession(botContext.DATA_DIR, currentSession);
             }
 
+            const media = extractMessageMedia(update.message);
+            if (media) {
+              await handleMediaMessage(token, update.message, media);
+              continue;
+            }
+
             const hasText = Boolean(update.message.text || update.message.caption);
             const messageUrls = hasText ? extractMessageUrls(update.message) : [];
             if (messageUrls.length && (currentSession.downloadMode || !currentSession.activeSegmentId)) {
@@ -5665,10 +8236,7 @@ export async function startTelegramBot(context) {
               continue;
             }
 
-            const media = extractMessageMedia(update.message);
-            if (media) {
-              await handleMediaMessage(token, update.message, media);
-            } else if (hasText) {
+            if (hasText) {
               await handleTextMessage(token, update.message);
             }
           } else if (update.callback_query) {

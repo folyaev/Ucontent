@@ -54,7 +54,11 @@ async function loadPageChunk(pageId, attempt = 0) {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'notion-client-version': NOTION_CLIENT_VERSION
+        'notion-client-version': NOTION_CLIENT_VERSION,
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'accept-language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+        'origin': 'https://www.notion.so',
+        'referer': 'https://www.notion.so/'
       },
       body: JSON.stringify(body)
     });
@@ -71,6 +75,10 @@ async function loadPageChunk(pageId, attempt = 0) {
     throw new Error(`Notion loadPageChunk failed: ${response.status} ${response.statusText}`);
   }
   return response.json();
+}
+
+function isHeadingBlock(block) {
+  return ['header', 'sub_header', 'sub_sub_header'].includes(block?.type);
 }
 
 async function loadFullRecordMap(rootId) {
@@ -92,7 +100,7 @@ async function loadFullRecordMap(rootId) {
   const topLevelIds = page?.content || [];
   for (const id of topLevelIds) {
     const block = recordValue(blockTable[id]);
-    if (block?.type === 'sub_sub_header' && block.content?.length) {
+    if (isHeadingBlock(block) && block.content?.length) {
       await load(id);
     }
   }
@@ -314,7 +322,7 @@ export async function scrapeNotionRecordMapPage(url) {
   for (const childId of page.content || []) {
     const block = recordValue(blockTable[childId]);
     if (!block) continue;
-    if (block.type === 'sub_sub_header') break;
+    if (isHeadingBlock(block)) break;
     const rendered = renderBlock(block, recordMap);
     if (rendered) prelude.push(rendered);
   }
@@ -329,7 +337,7 @@ export async function scrapeNotionRecordMapPage(url) {
       continue;
     }
 
-    if (block.type !== 'sub_sub_header') {
+    if (!isHeadingBlock(block)) {
       index += 1;
       continue;
     }
@@ -348,16 +356,14 @@ export async function scrapeNotionRecordMapPage(url) {
     if (block.content?.length) {
       const renderedChildren = renderChildren(block, recordMap);
       if (renderedChildren) bodyParts.push(renderedChildren);
+    }
+    index += 1;
+    while (index < (page.content || []).length) {
+      const nextBlock = recordValue(blockTable[page.content[index]]);
+      if (!nextBlock || isHeadingBlock(nextBlock)) break;
+      const rendered = renderBlock(nextBlock, recordMap);
+      if (rendered) bodyParts.push(rendered);
       index += 1;
-    } else {
-      index += 1;
-      while (index < (page.content || []).length) {
-        const nextBlock = recordValue(blockTable[page.content[index]]);
-        if (!nextBlock || nextBlock.type === 'sub_sub_header') break;
-        const rendered = renderBlock(nextBlock, recordMap);
-        if (rendered) bodyParts.push(rendered);
-        index += 1;
-      }
     }
     if (bodyParts.length) output.push(bodyParts.join('\n\n'));
   }

@@ -8,3 +8,10 @@ media/
 Remotion/out/
 __pycache__/
 *.pyc
+*.wav
+*.mp3
+scratch/
+verification_text.txt
+cleaned-script-*.txt
+transcription.json
+

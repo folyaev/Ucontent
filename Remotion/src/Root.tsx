@@ -8,8 +8,8 @@ import {
 } from './data/defaultQuote';
 
 const FPS = 50;
-const DURATION_2X1_SECONDS = 7;
-const DURATION_1X1_SECONDS = 6;
+const DURATION_2X1_SECONDS = 9;
+const DURATION_1X1_SECONDS = 8;
 
 export const RemotionRoot = () => {
   return (

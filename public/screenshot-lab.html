@@ -15,7 +15,8 @@
         <span id="shotlab-status">loading</span>
       </div>
       <form id="shotlab-form" class="scrape-form">
-        <input id="shotlab-scrape" type="text" placeholder="Scrape ID" autocomplete="off" />
+        <input id="shotlab-scrape" type="text" placeholder="Latest scrape" autocomplete="off" list="shotlab-scrapes-list" />
+        <datalist id="shotlab-scrapes-list"></datalist>
         <button type="submit">Open</button>
       </form>
       <select id="shotlab-preset" title="Формат">
@@ -24,6 +25,7 @@
         <option value="1x1">1:1</option>
       </select>
       <button id="shotlab-capture" type="button" title="Сделать скриншот">📸</button>
+      <button id="shotlab-session" type="button" title="Docker browser session">Session</button>
       <button id="shotlab-manual" type="button" title="Открыть отдельное окно">↗</button>
       <a class="topbar-link" href="/script-text">Script</a>
     </header>

@@ -43,6 +43,8 @@ let currentSegments = [];
 let activeMediaSegmentId = "";
 let activeMediaTopic = "";
 let saveTimer = null;
+let hasUnsavedChanges = false;
+let saveInFlight = null;
 let activeDownloadPoll = null;
 let pendingFocusStart = null;
 let lastFocusedSegmentId = "";
@@ -52,6 +54,7 @@ let rssLoading = false;
 let segmentSearch = null;
 let pendingSearchDialog = null;
 let remotionLogoSearchTimer = null;
+let openSegmentMenuId = "";
 
 function setStatus(message) {
   statusEl.textContent = message;
@@ -283,6 +286,7 @@ function segmentBlock(block) {
   const host = isLink ? escapeHtml(hostOf(trimmed)) : "";
   const mediaHtml = renderSegmentMediaItems(segment);
   const searchHtml = renderSegmentSearch(block);
+  const menuId = segment?.id || `${block.start}:${block.end}`;
   const preview = isLink
     ? `
       <a class="link-preview is-empty" href="${safeText}" target="_blank" rel="noreferrer" data-preview-url="${safeText}">
@@ -296,16 +300,19 @@ function segmentBlock(block) {
     `
     : "";
   return `
-    <div class="block content-segment is-${kind}${isDone ? " is-done" : ""}" data-segment-id="${escapeHtml(segment?.id || "")}" data-start="${block.start}" data-end="${block.end}">
+    <div class="block content-segment is-${kind}${isDone ? " is-done" : ""}${openSegmentMenuId && openSegmentMenuId === menuId ? " is-menu-open" : ""}" data-segment-id="${escapeHtml(segment?.id || "")}" data-menu-id="${escapeHtml(menuId)}" data-start="${block.start}" data-end="${block.end}">
       <div class="content-segment-toolbar">
-        <span>${escapeHtml(type)}${segment?.id ? ` · ${escapeHtml(segment.id)}` : ""}</span>
-        <button type="button" data-action="move-up" data-start="${block.start}" data-end="${block.end}">↑</button>
-        <button type="button" data-action="move-down" data-start="${block.start}" data-end="${block.end}">↓</button>
-        <button type="button" data-action="segment-search" data-start="${block.start}" data-end="${block.end}" title="Search links">🔎</button>
-        <button type="button" data-action="attach-media" data-segment-id="${escapeHtml(segment?.id || "")}" title="Media">📎</button>
-        <button type="button" data-action="add-after" data-start="${block.start}" data-end="${block.end}">+</button>
-        <button type="button" data-action="delete-segment" data-start="${block.start}" data-end="${block.end}">-</button>
-        <button type="button" class="${isDone ? "is-active" : ""}" data-action="toggle-done" data-segment-id="${escapeHtml(segment?.id || "")}" title="${isDone ? "Mark not done" : "Mark done"}">✓</button>
+        <button type="button" class="segment-menu-toggle" data-action="toggle-segment-menu" data-menu-id="${escapeHtml(menuId)}" data-segment-id="${escapeHtml(segment?.id || "")}" data-start="${block.start}" data-end="${block.end}" title="Actions">⋯</button>
+        <div class="segment-action-menu">
+          <span>${escapeHtml(type)}${segment?.id ? ` · ${escapeHtml(segment.id)}` : ""}</span>
+          <button type="button" data-action="move-up" data-start="${block.start}" data-end="${block.end}" title="Move up">↑</button>
+          <button type="button" data-action="move-down" data-start="${block.start}" data-end="${block.end}" title="Move down">↓</button>
+          <button type="button" data-action="segment-search" data-start="${block.start}" data-end="${block.end}" title="Search links">🔎</button>
+          <button type="button" data-action="attach-media" data-segment-id="${escapeHtml(segment?.id || "")}" title="Media">📎</button>
+          <button type="button" data-action="add-after" data-start="${block.start}" data-end="${block.end}" title="Add after">+</button>
+          <button type="button" data-action="delete-segment" data-start="${block.start}" data-end="${block.end}" title="Delete">-</button>
+          <button type="button" class="${isDone ? "is-active" : ""}" data-action="toggle-done" data-segment-id="${escapeHtml(segment?.id || "")}" title="${isDone ? "Mark not done" : "Mark done"}">✓</button>
+        </div>
       </div>
       <textarea data-action="edit-segment" data-start="${block.start}" data-end="${block.end}" rows="1">${safeText}</textarea>
       ${mediaHtml}
@@ -603,29 +610,49 @@ async function rejectRssCandidate(button) {
 function scheduleSave() {
   if (!currentScrape?.id) return;
   clearTimeout(saveTimer);
+  saveTimer = null;
+  hasUnsavedChanges = true;
   setStatus("unsaved changes");
-  saveTimer = setTimeout(() => {
-    void saveNow();
-  }, 500);
 }
 
 async function saveNow() {
   if (!currentScrape?.id) return;
-  const content = contentFromLines();
-  const response = await fetch(`/api/scrapes/${encodeURIComponent(currentScrape.id)}`, {
-    method: "PUT",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ content })
-  });
-  const data = await response.json();
-  if (!response.ok) {
-    setStatus(data.error || "save failed");
-    return;
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  if (saveInFlight) return saveInFlight;
+  saveInFlight = (async () => {
+    const content = contentFromLines();
+    const response = await fetch(`/api/scrapes/${encodeURIComponent(currentScrape.id)}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ content })
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      setStatus(data.error || "save failed");
+      return null;
+    }
+    if (contentFromLines() !== content) {
+      currentScrape = {
+        ...data.scrape,
+        content: contentFromLines()
+      };
+      hasUnsavedChanges = true;
+      setStatus("unsaved changes");
+      return data.scrape;
+    }
+    currentScrape = data.scrape;
+    hasUnsavedChanges = false;
+    setStatus(`${currentScrape.title || currentScrape.id} - saved`);
+    currentSegments = Array.isArray(currentScrape.segments) ? currentScrape.segments : [];
+    renderDocument();
+    return data.scrape;
+  })();
+  try {
+    return await saveInFlight;
+  } finally {
+    saveInFlight = null;
   }
-  currentScrape = data.scrape;
-  setStatus(`${currentScrape.title || currentScrape.id} - saved`);
-  currentSegments = Array.isArray(currentScrape.segments) ? currentScrape.segments : [];
-  renderDocument();
 }
 
 function defaultSegmentText() {
@@ -731,6 +758,7 @@ async function patchSegment(segmentId, patch) {
 async function toggleSegmentDone(segmentId) {
   const segment = segmentById(segmentId);
   if (!segment) return;
+  if (hasUnsavedChanges) await saveNow();
   await patchSegment(segmentId, { is_done: !Boolean(segment.is_done) });
 }
 
@@ -1095,6 +1123,7 @@ async function loadScrape(id = "") {
   if (!currentScrape) throw new Error("No saved scrape yet");
   currentLines = String(currentScrape.content ?? "").split(/\r?\n/);
   currentSegments = Array.isArray(currentScrape.segments) ? currentScrape.segments : [];
+  hasUnsavedChanges = false;
   renderDocument();
   setStatus(`${currentScrape.title || currentScrape.id} - ${currentLines.length} lines`);
   input.value = currentScrape.url || "";
@@ -1117,10 +1146,24 @@ async function refreshScrapeList() {
 
 documentEl.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-action]");
-  if (!button) return;
+  if (!button) {
+    if (!event.target.closest?.(".content-segment-toolbar") && openSegmentMenuId) {
+      openSegmentMenuId = "";
+      document.querySelectorAll(".content-segment.is-menu-open").forEach((item) => item.classList.remove("is-menu-open"));
+    }
+    return;
+  }
   event.preventDefault();
   event.stopPropagation();
   const action = button.dataset.action;
+  if (action === "toggle-segment-menu") {
+    const menuId = button.dataset.menuId || `${button.dataset.start}:${button.dataset.end}`;
+    openSegmentMenuId = openSegmentMenuId === menuId ? "" : menuId;
+    renderDocument();
+    return;
+  }
+  const keepMenuOpen = ["attach-media", "segment-search"].includes(action);
+  if (!keepMenuOpen) openSegmentMenuId = "";
   if (action === "add-after") insertSegmentAfter(button.dataset.end);
   if (action === "delete-segment") deleteSegment(button.dataset.start, button.dataset.end);
   if (action === "add-topic-segment") insertTopicSegment(button.dataset.line);
@@ -1351,6 +1394,13 @@ documentEl.addEventListener("input", (event) => {
   replaceSegment(target);
 });
 
+documentEl.addEventListener("focusout", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLTextAreaElement)) return;
+  if (target.dataset.action !== "edit-segment") return;
+  if (hasUnsavedChanges) void saveNow();
+});
+
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   const url = input.value.trim();
@@ -1359,6 +1409,7 @@ form.addEventListener("submit", async (event) => {
   button.disabled = true;
   setStatus("scraping Notion...");
   try {
+    if (hasUnsavedChanges) await saveNow();
     const response = await fetch("/api/scrape", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -1382,6 +1433,7 @@ form.addEventListener("submit", async (event) => {
 
 selectEl.addEventListener("change", async () => {
   try {
+    if (hasUnsavedChanges) await saveNow();
     await loadScrape(selectEl.value);
   } catch (error) {
     setStatus(error.message || "Could not load scrape");
@@ -1393,6 +1445,7 @@ xmlExportButton.addEventListener("click", async () => {
   const originalText = xmlExportButton.textContent;
   try {
     xmlExportButton.disabled = true;
+    if (hasUnsavedChanges) await saveNow();
     xmlExportButton.textContent = "Exporting...";
     setStatus("Exporting XML...");
 
@@ -1439,6 +1492,7 @@ tgSendButton.addEventListener("click", async () => {
   const originalText = tgSendButton.textContent;
   try {
     tgSendButton.disabled = true;
+    if (hasUnsavedChanges) await saveNow();
     tgSendButton.textContent = "Sending...";
     setStatus("Broadcasting to Telegram...");
     const response = await fetch(`/api/scrapes/${encodeURIComponent(currentScrape.id)}/send-to-tg`, {
@@ -1460,6 +1514,7 @@ notionRefreshButton.addEventListener("click", async () => {
   notionRefreshButton.disabled = true;
   setStatus("refreshing Notion...");
   try {
+    if (hasUnsavedChanges) await saveNow();
     const response = await fetch(`/api/scrapes/${encodeURIComponent(currentScrape.id)}/refresh`, {
       method: "POST"
     });

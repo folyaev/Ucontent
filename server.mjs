@@ -1,8 +1,10 @@
 import fs from "node:fs/promises";
-import { createWriteStream, existsSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer } from "node:http";
+import { connect as netConnect } from "node:net";
+import dns from "node:dns";
 import { createHash, randomBytes } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
@@ -12,8 +14,11 @@ import { scrapeNotionPage } from "./vendor/HeadlessNotion/notion-scraper.js";
 import { createXmlExportUtils } from "./vendor/xml-export/xml-export.js";
 import { startTelegramBot, triggerWebBroadcast } from "./telegram-bot.mjs";
 import { createMediaIndex } from "./media-index.mjs";
+import { loadCookiesFromPath, normalizeCookiesForPuppeteer } from "./tools/screenshot-engine/cookie-utils.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+dns.setDefaultResultOrder("ipv4first");
 
 async function loadEnv(dir) {
   try {
@@ -43,9 +48,74 @@ const PORT = Number(process.env.UCONTENT_PORT || 5197);
 const UCONTENT_SELF_URL = (process.env.UCONTENT_SELF_URL || `http://127.0.0.1:${PORT}`).replace(/\/$/, "");
 const DATA_DIR = path.join(__dirname, "data", "scrapes");
 const HISTORY_DIR = path.join(DATA_DIR, "history");
+const RUNTIME_DATA_ROOT = path.join(__dirname, "data");
 const PUBLIC_DIR = path.join(__dirname, "public");
 const REMOTION_ROOT = path.join(__dirname, "Remotion");
+const SCREENSHOT_BROWSER_PROFILE_DIR = process.env.SCREENSHOT_BROWSER_PROFILE_DIR || path.join(RUNTIME_DATA_ROOT, "browser-profile");
+const SCREENSHOT_REMOTE_DEBUGGING_PORT = Number(process.env.SCREENSHOT_REMOTE_DEBUGGING_PORT || 9222);
+const SCREENSHOT_VNC_PORT = Number(process.env.SCREENSHOT_VNC_PORT || 5900);
+const SCREENSHOT_NOVNC_PORT = Number(process.env.SCREENSHOT_NOVNC_PORT || 6080);
 const PAMPAM_ROOT = process.env.PAMPAM_ROOT || process.env.MEDIA_DOWNLOAD_ROOT || path.join(__dirname, "media");
+
+function cleanHostPrefix(filePath) {
+  let p = String(filePath ?? "").trim().replace(/\\/g, "/");
+  const hostRoots = [
+    "C:/Users/Nemifist/YandexDisk/PAMPAM",
+    process.env.PAMPAM_HOST_ROOT,
+  ].map(r => String(r || "").trim().replace(/\\/g, "/")).filter(Boolean);
+
+  for (const root of hostRoots) {
+    if (p.toLowerCase().startsWith(root.toLowerCase())) {
+      p = p.slice(root.length);
+      break;
+    }
+  }
+  return p.replace(/^\/+/, "");
+}
+
+async function ensureMediaSymlink() {
+  const targetLink = path.join(REMOTION_ROOT, "public", "media");
+  try {
+    const stats = await fs.lstat(targetLink).catch(() => null);
+    if (stats) {
+      if (stats.isSymbolicLink() || stats.isDirectory()) {
+        return;
+      }
+      await fs.rm(targetLink, { recursive: true, force: true });
+    }
+    const type = process.platform === "win32" ? "junction" : "dir";
+    await fs.symlink(PAMPAM_ROOT, targetLink, type);
+    console.log(`Created media symlink (${type}): ${PAMPAM_ROOT} -> ${targetLink}`);
+  } catch (err) {
+    console.warn(`Failed to create media symlink: ${err.message}`);
+  }
+}
+
+async function syncDefaultLogos() {
+  const srcDir = path.join(REMOTION_ROOT, "src", "logos");
+  const destDir = path.join(PAMPAM_ROOT, "logos");
+  try {
+    await fs.mkdir(destDir, { recursive: true });
+    const srcEntries = await fs.readdir(srcDir, { withFileTypes: true }).catch(() => []);
+    let copiedCount = 0;
+    for (const entry of srcEntries) {
+      if (entry.isFile() && isLogoFile(entry.name)) {
+        const srcFile = path.join(srcDir, entry.name);
+        const destFile = path.join(destDir, entry.name);
+        const destExists = await pathExists(destFile);
+        if (!destExists) {
+          await fs.copyFile(srcFile, destFile);
+          copiedCount++;
+        }
+      }
+    }
+    if (copiedCount > 0) {
+      console.log(`Synced ${copiedCount} default logos to ${destDir}`);
+    }
+  } catch (err) {
+    console.warn(`Failed to sync default logos: ${err.message}`);
+  }
+}
 const UCONTENT_STAGING_ROOT = process.env.UCONTENT_STAGING_ROOT || path.join(__dirname, ".staging");
 const DOWNLOAD_STAGING_ROOT = path.join(UCONTENT_STAGING_ROOT, "downloads");
 const QUARANTINE_ROOT = path.join(UCONTENT_STAGING_ROOT, "quarantine");
@@ -57,7 +127,7 @@ const MEDIA_JOBS = new Map();
 const NOTION_REFRESH_JOBS = new Map();
 const MEDIA_JOB_LIMIT = 100;
 const MEDIA_DOWNLOAD_MAX_BYTES = 1024 * 1024 * 1024;
-const DOWNLOAD_COMMAND_STALL_TIMEOUT_MS = Number(process.env.DOWNLOAD_COMMAND_STALL_TIMEOUT_MS || 120_000);
+const DOWNLOAD_COMMAND_STALL_TIMEOUT_MS = Number(process.env.DOWNLOAD_COMMAND_STALL_TIMEOUT_MS || 10 * 60_000);
 const DOWNLOAD_COMMAND_MAX_TIMEOUT_MS = Number(process.env.DOWNLOAD_COMMAND_MAX_TIMEOUT_MS || 30 * 60_000);
 const MEDIA_DISCOVERY_MAX_HTML_BYTES = 2 * 1024 * 1024;
 const MEDIA_DISCOVERY_MAX_CANDIDATES = 20;
@@ -67,6 +137,11 @@ const WEBAPP_TOKEN_PATH = path.join(DATA_DIR, "webapp-access-token");
 const MEDIA_INDEX = createMediaIndex({ filePath: path.join(__dirname, "data", "media-index.json") });
 let quickTunnelUrl = "";
 let quickTunnelProcess = null;
+let screenshotBrowserSession = null;
+let screenshotBrowserLastError = "";
+let mediaFilesCache = null;
+const MEDIA_FILES_CACHE_TTL_MS = 10_000;
+const IGNORED_MEDIA_ROOT_FOLDERS = new Set(["unsorted", "work", "graphics", "archive_projects", "logos"]);
 const DEFAULT_YTDLP_FORMAT = [
   "bv*[height<=1080][vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a]/",
   "b[height<=1080][vcodec^=avc1][ext=mp4]/",
@@ -404,7 +479,17 @@ function xmlEscape(value) {
     .replace(/'/g, "&apos;");
 }
 
+function normalizeBundledLogoPath(value) {
+  const normalized = String(value ?? "").replace(/\\/g, "/").trim();
+  const match = normalized.match(/(?:^|\/)Remotion\/src\/logos\/([^/]+)$/i);
+  if (!match?.[1]) return "";
+  const fileName = path.posix.basename(match[1]);
+  return isLogoFile(fileName) ? `logos/${fileName}` : "";
+}
+
 function normalizeMediaFilePath(value) {
+  const bundledLogoPath = normalizeBundledLogoPath(value);
+  if (bundledLogoPath) return bundledLogoPath;
   return String(value ?? "").replace(/\\/g, "/").replace(/^\/+/, "").trim();
 }
 
@@ -527,7 +612,12 @@ function makeFileNameUnique(fileName) {
 function looksGenericMediaFileStem(value) {
   const normalized = asciiFilePart(String(value || ""), "").replace(/[._-]+/g, "");
   if (!normalized) return true;
-  return /^(img|image|photo|screenshot|screen|file|document|video|animation|audio|voice|videonote|download|media)\d{0,16}$/i.test(normalized);
+  if (/^(img|image|photo|screenshot|screen|file|document|video|animation|audio|voice|videonote|download|media)\d{0,16}$/i.test(normalized)) return true;
+  if (/^\d{8,}$/.test(normalized)) return true;
+  if (/^[a-f0-9]{12,}$/i.test(normalized)) return true;
+  if (/^[a-z0-9]{10,48}$/i.test(normalized) && /\d/.test(normalized) && !/[aeiou]{2,}/i.test(normalized)) return true;
+  if (/^[a-z0-9]{6,16}$/i.test(normalized) && /\d/.test(normalized) && /[a-z]/i.test(normalized)) return true;
+  return false;
 }
 
 function hostLabelFromUrl(rawUrl) {
@@ -538,7 +628,7 @@ function hostLabelFromUrl(rawUrl) {
   }
 }
 
-function descriptiveDownloadFileName(job, originalName, index = 1) {
+function descriptiveDownloadFileName(job, originalName, index = 1, total = 1) {
   const parsed = path.parse(String(originalName || ""));
   const ext = parsed.ext || ".bin";
   const title = normalizeYtDlpMetaValue(job?.meta_title);
@@ -547,11 +637,11 @@ function descriptiveDownloadFileName(job, originalName, index = 1) {
   const host = hostLabelFromUrl(job?.meta_webpage_url || job?.url);
   const rawLabel = [description, title, uploader, host].find((value) => {
     const stem = asciiFilePart(value, "");
-    return stem && !looksGenericMediaFileStem(stem);
+    return stem && !looksGenericMediaFileStem(stem) && !looksGenericSocialMetadata(value);
   });
   if (!rawLabel) return originalName;
   const stem = asciiFilePart(rawLabel, "media").slice(0, 90).replace(/[._-]+$/g, "");
-  const suffix = index > 1 ? `_${String(index).padStart(2, "0")}` : "";
+  const suffix = total > 1 ? `_${String(index).padStart(2, "0")}` : "";
   return `${stem || "media"}${suffix}${ext}`;
 }
 
@@ -621,7 +711,7 @@ async function convertWebpFileToPng(sourcePath) {
 }
 
 function safeResolveMediaPath(relativePath) {
-  const clean = String(relativePath ?? "").replace(/^[/\\]+/, "");
+  const clean = normalizeMediaFilePath(cleanHostPrefix(String(relativePath ?? ""))).replace(/^[/\\]+/, "");
   if (!clean) return "";
   const root = path.resolve(PAMPAM_ROOT);
   const target = path.resolve(PAMPAM_ROOT, clean);
@@ -643,6 +733,121 @@ function isImageFile(filePath) {
 
 function isVideoMediaFile(filePath) {
   return [".mp4", ".mov", ".webm", ".mkv"].includes(path.extname(filePath).toLowerCase());
+}
+
+async function resolveFfprobePath() {
+  const tools = await resolveDownloaderTools();
+  const ffmpegPath = tools.ffmpeg_path || "ffmpeg";
+  const ffprobeName = process.platform === "win32" ? "ffprobe.exe" : "ffprobe";
+  const sibling = path.join(path.dirname(ffmpegPath), ffprobeName);
+  return await pathExists(sibling) ? sibling : ffprobeName;
+}
+
+async function probeMediaStreams(filePath) {
+  const ffprobe = await resolveFfprobePath();
+  const { stdout } = await execFileAsync(ffprobe, [
+    "-v", "error",
+    "-show_entries", "stream=index,codec_type,codec_name,width,height,pix_fmt:format=duration,size",
+    "-of", "json",
+    filePath
+  ], {
+    windowsHide: true,
+    timeout: 30_000,
+    maxBuffer: 1024 * 1024
+  });
+  const parsed = JSON.parse(String(stdout || "{}"));
+  const streams = Array.isArray(parsed.streams) ? parsed.streams : [];
+  const video = streams.find((stream) => stream.codec_type === "video") || null;
+  const audio = streams.find((stream) => stream.codec_type === "audio") || null;
+  return { streams, video, audio, format: parsed.format || {} };
+}
+
+async function verifyDownloadedMediaIntegrityOnDisk(filePath, fileName = "") {
+  const stats = await fs.stat(filePath).catch(() => null);
+  if (!stats?.isFile() || stats.size <= 0) {
+    throw new Error(`Downloaded media failed size validation: ${fileName || path.basename(filePath)}`);
+  }
+  const probe = await probeMediaStreams(filePath).catch((error) => {
+    throw new Error(`Downloaded media failed ffprobe validation: ${fileName || path.basename(filePath)}: ${error.message}`);
+  });
+  if (!probe.streams.length) {
+    throw new Error(`Downloaded media has no decodable streams: ${fileName || path.basename(filePath)}`);
+  }
+  const tools = await resolveDownloaderTools();
+  const ffmpeg = tools.ffmpeg_path || "ffmpeg";
+  await execFileAsync(ffmpeg, [
+    "-v", "error",
+    "-i", filePath,
+    "-f", "null",
+    "-"
+  ], {
+    windowsHide: true,
+    timeout: 10 * 60_000,
+    maxBuffer: 8 * 1024 * 1024
+  }).catch((error) => {
+    throw new Error(`Downloaded media failed full decode validation: ${fileName || path.basename(filePath)}: ${error.message}`);
+  });
+  return probe;
+}
+
+function isPremiereFriendlyVideoProbe(probe = {}, fileName = "") {
+  const video = probe.video || null;
+  if (!video) return false;
+  const ext = path.extname(fileName).toLowerCase();
+  const codec = String(video.codec_name || "").toLowerCase();
+  const pixFmt = String(video.pix_fmt || "").toLowerCase();
+  return ext === ".mp4" && ["h264", "avc1"].includes(codec) && (!pixFmt || pixFmt === "yuv420p");
+}
+
+async function ensurePremiereFriendlyVideoOnDisk(dir, fileName) {
+  if (!isVideoMediaFile(fileName)) return fileName;
+  const sourcePath = path.join(dir, fileName);
+  let probe = null;
+  try {
+    probe = await probeMediaStreams(sourcePath);
+  } catch (error) {
+    throw new Error(`Downloaded video failed ffprobe validation: ${fileName}: ${error.message}`);
+  }
+  if (!probe.video) {
+    await fs.unlink(sourcePath).catch(() => null);
+    throw new Error(`Downloaded file has no video stream: ${fileName}`);
+  }
+  if (isPremiereFriendlyVideoProbe(probe, fileName)) return fileName;
+
+  const tools = await resolveDownloaderTools();
+  const ffmpeg = tools.ffmpeg_path || "ffmpeg";
+  const parsed = path.parse(fileName);
+  const targetName = await ensureUniqueFileNameInDir(dir, `${parsed.name}_premiere.mp4`, fileName);
+  const targetPath = path.join(dir, targetName);
+  try {
+    await execFileAsync(ffmpeg, [
+      "-hide_banner",
+      "-loglevel", "error",
+      "-y",
+      "-i", sourcePath,
+      "-map", "0:v:0",
+      "-map", "0:a?",
+      "-c:v", "libx264",
+      "-pix_fmt", "yuv420p",
+      "-preset", "veryfast",
+      "-crf", "18",
+      "-c:a", "aac",
+      "-b:a", "160k",
+      "-movflags", "+faststart",
+      targetPath
+    ], {
+      windowsHide: true,
+      timeout: 10 * 60_000,
+      maxBuffer: 8 * 1024 * 1024
+    });
+    const converted = await fs.stat(targetPath).catch(() => null);
+    if (!converted?.isFile() || converted.size <= 0) throw new Error("ffmpeg produced no output");
+    await fs.unlink(sourcePath).catch(() => null);
+    return targetName;
+  } catch (error) {
+    await fs.unlink(targetPath).catch(() => null);
+    throw new Error(`Downloaded video is not Premiere-compatible and conversion failed: ${fileName}: ${error.message}`);
+  }
 }
 
 function isLogoFile(filePath) {
@@ -716,8 +921,9 @@ async function publishDownloadedFilesFromStaging(job, stagingDir, outputFiles, s
     if (!stats?.isFile() || stats.size <= 0) continue;
     const baseName = path.basename(relName);
     const parsedBase = path.parse(baseName);
-    const descriptiveName = looksGenericMediaFileStem(parsedBase.name) || isXOrTwitter(job?.url)
-      ? descriptiveDownloadFileName(job, baseName, published.length + 1)
+    const totalFiles = Array.isArray(outputFiles) ? outputFiles.length : 1;
+    const descriptiveName = looksGenericMediaFileStem(parsedBase.name) || isXOrTwitter(job?.url) || totalFiles > 1
+      ? descriptiveDownloadFileName(job, baseName, published.length + 1, totalFiles)
       : baseName;
     const targetName = await ensureUniqueFileNameInDir(finalDir, descriptiveName);
     const target = assertPathInsideRoot(finalDir, path.join(finalDir, targetName), "publish target");
@@ -743,7 +949,10 @@ async function publishDownloadedFilesFromStaging(job, stagingDir, outputFiles, s
 
 async function listMediaFiles(maxFiles = 800) {
   await fs.mkdir(PAMPAM_ROOT, { recursive: true });
-  const ignoredRootFolders = new Set(["unsorted", "archive_projects", "graphics"]);
+  const now = Date.now();
+  if (mediaFilesCache && mediaFilesCache.maxFiles >= maxFiles && now - mediaFilesCache.createdAt < MEDIA_FILES_CACHE_TTL_MS) {
+    return mediaFilesCache.files.slice(0, maxFiles);
+  }
   const files = [];
   const stack = [""];
   while (stack.length && files.length < maxFiles) {
@@ -755,7 +964,7 @@ async function listMediaFiles(maxFiles = 800) {
       const relPath = currentRel ? path.join(currentRel, entry.name) : entry.name;
       if (entry.isDirectory()) {
         if (entry.name.trim().toLowerCase() === "_originals") continue;
-        if (!currentRel && ignoredRootFolders.has(entry.name.trim().toLowerCase())) continue;
+        if (!currentRel && IGNORED_MEDIA_ROOT_FOLDERS.has(entry.name.trim().toLowerCase())) continue;
         stack.push(relPath);
         continue;
       }
@@ -776,7 +985,9 @@ async function listMediaFiles(maxFiles = 800) {
       });
     }
   }
-  return files.sort((a, b) => String(b.updated_at ?? "").localeCompare(String(a.updated_at ?? "")));
+  const sorted = files.sort((a, b) => String(b.updated_at ?? "").localeCompare(String(a.updated_at ?? "")));
+  mediaFilesCache = { createdAt: now, maxFiles, files: sorted };
+  return sorted.slice(0, maxFiles);
 }
 
 function logoDisplayName(relPath, metadata = {}) {
@@ -1060,6 +1271,351 @@ async function saveScreenshotLabCapture({ scrapeId, linkIndex, url, preset, prof
   };
 }
 
+async function puppeteerExecutablePath() {
+  const explicit = String(process.env.SCREENSHOT_CHROME_PATH || process.env.PUPPETEER_EXECUTABLE_PATH || "").trim();
+  if (explicit) return explicit;
+  const puppeteerModule = await import("puppeteer");
+  const puppeteer = puppeteerModule?.default ?? puppeteerModule;
+  return puppeteer.executablePath();
+}
+
+async function puppeteerModule() {
+  const module = await import("puppeteer");
+  return module?.default ?? module;
+}
+
+async function removeStaleChromeProfileLocks(profileDir) {
+  const names = ["SingletonLock", "SingletonSocket", "SingletonCookie"];
+  await Promise.all(names.map((name) => fs.rm(path.join(profileDir, name), { force: true, recursive: true }).catch(() => null)));
+}
+
+function browserSessionStatus() {
+  const running = Boolean(screenshotBrowserSession?.process && screenshotBrowserSession.process.exitCode === null);
+  if (!running) screenshotBrowserSession = null;
+  const port = SCREENSHOT_REMOTE_DEBUGGING_PORT;
+  return {
+    running,
+    profile_dir: SCREENSHOT_BROWSER_PROFILE_DIR,
+    port,
+    vnc_url: running ? screenshotBrowserSession.vncUrl || "" : "",
+    devtools_url: running ? screenshotBrowserSession.devtoolsUrl || `http://localhost:${PORT}/devtools/json/list` : "",
+    started_at: running ? screenshotBrowserSession.startedAt : "",
+    last_error: running ? screenshotBrowserSession.recentError || "" : screenshotBrowserLastError
+  };
+}
+
+function rewriteDevToolsFrontendUrl(frontend, wsPath) {
+  return String(frontend || "")
+    .replace(/ws=[^&]+/i, `ws=localhost:${PORT}${wsPath ? `/devtoolsws${wsPath}` : ""}`)
+    .replace(/^\/devtools\//, `http://localhost:${PORT}/devtools/devtools/`);
+}
+
+function directDevToolsFrontendUrl(frontend, wsPath) {
+  if (!wsPath) return `http://127.0.0.1:${PORT}/devtools/json/list`;
+  return `http://127.0.0.1:${PORT}/devtools/devtools/inspector.html?ws=127.0.0.1:${PORT}/devtoolsws${wsPath}`;
+}
+
+function rewriteDevToolsPayload(value) {
+  const localHttp = `http://localhost:${PORT}/devtools`;
+  const localWs = `ws://localhost:${PORT}/devtoolsws`;
+  const rewriteItem = (item) => {
+    if (!item || typeof item !== "object") return item;
+    const next = { ...item };
+    const ws = String(next.webSocketDebuggerUrl || "");
+    const wsPath = ws.replace(/^ws:\/\/[^/]+/i, "");
+    if (wsPath) next.webSocketDebuggerUrl = `${localWs}${wsPath}`;
+    const frontend = String(next.devtoolsFrontendUrl || "");
+    if (frontend) {
+      next.devtoolsFrontendUrl = rewriteDevToolsFrontendUrl(frontend, wsPath);
+    }
+    return next;
+  };
+  if (Array.isArray(value)) return value.map(rewriteItem);
+  return rewriteItem(value);
+}
+
+async function proxyDevToolsHttp(reqUrl, res) {
+  if (!browserSessionStatus().running) {
+    text(res, 409, "Browser session is not running");
+    return;
+  }
+  const upstreamPath = reqUrl.pathname.replace(/^\/devtools(?=\/|$)/, "") || "/";
+  const upstreamUrl = `http://127.0.0.1:${SCREENSHOT_REMOTE_DEBUGGING_PORT}${upstreamPath}${reqUrl.search || ""}`;
+  const response = await fetch(upstreamUrl).catch((error) => {
+    throw new Error(`Docker Chrome DevTools is not ready: ${error.message}`);
+  });
+  const contentType = String(response.headers.get("content-type") || "");
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (contentType.includes("application/json")) {
+    try {
+      const payload = rewriteDevToolsPayload(JSON.parse(buffer.toString("utf8")));
+      json(res, response.status, payload);
+      return;
+    } catch {
+      // fall through
+    }
+  }
+  res.writeHead(response.status, {
+    "content-type": contentType || "application/octet-stream",
+    "cache-control": "no-store"
+  });
+  res.end(buffer);
+}
+
+async function waitForDevToolsTarget(timeoutMs = 5000) {
+  const started = Date.now();
+  let lastError = "";
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${SCREENSHOT_REMOTE_DEBUGGING_PORT}/json/list`);
+      if (response.ok) {
+        const list = await response.json();
+        const targets = Array.isArray(list) ? list : [];
+        const target = targets.find((item) => item?.type === "page") || targets[0] || null;
+        if (target) {
+          const wsPath = String(target.webSocketDebuggerUrl || "").replace(/^ws:\/\/[^/]+/i, "");
+          const frontend = directDevToolsFrontendUrl(target.devtoolsFrontendUrl || "", wsPath);
+          return {
+            target,
+            devtoolsUrl: frontend || `http://localhost:${PORT}/devtools/json/list`
+          };
+        }
+      }
+    } catch (error) {
+      lastError = error.message;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`Docker Chrome DevTools did not become ready${lastError ? `: ${lastError}` : ""}`);
+}
+
+async function browserSessionWebSocketEndpoint() {
+  const response = await fetch(`http://127.0.0.1:${SCREENSHOT_REMOTE_DEBUGGING_PORT}/json/version`);
+  if (!response.ok) throw new Error(`DevTools version endpoint returned HTTP ${response.status}`);
+  const data = await response.json();
+  const endpoint = String(data?.webSocketDebuggerUrl || "").trim();
+  if (!endpoint) throw new Error("DevTools did not return browser websocket endpoint");
+  return endpoint;
+}
+
+async function loadFirefoxProfileCookies(profileDir) {
+  const cookiesDb = path.join(profileDir, "cookies.sqlite");
+  if (!existsSync(cookiesDb)) return [];
+  const script = [
+    "import json, sqlite3, sys",
+    "db = sys.argv[1]",
+    "conn = sqlite3.connect(db)",
+    "conn.row_factory = sqlite3.Row",
+    "rows = conn.execute('select host, path, isSecure, isHttpOnly, expiry, name, value from moz_cookies').fetchall()",
+    "cookies = []",
+    "for row in rows:",
+    "    item = {'domain': row['host'], 'path': row['path'] or '/', 'secure': bool(row['isSecure']), 'httpOnly': bool(row['isHttpOnly']), 'name': row['name'], 'value': row['value']}",
+    "    if row['expiry'] and int(row['expiry']) > 0:",
+    "        item['expires'] = int(row['expiry'])",
+    "    cookies.append(item)",
+    "print(json.dumps(cookies))"
+  ].join("\n");
+  const { stdout } = await execFileAsync("python3", ["-c", script, cookiesDb], {
+    windowsHide: true,
+    timeout: 15000,
+    encoding: "utf8",
+    maxBuffer: 8 * 1024 * 1024
+  });
+  return JSON.parse(String(stdout || "[]"));
+}
+
+async function loadBrowserSessionCookies(startUrl = "") {
+  const firefoxProfileDir = path.join(RUNTIME_DATA_ROOT, "firefox-profile");
+  const firefoxCookies = await loadFirefoxProfileCookies(firefoxProfileDir).catch((error) => {
+    console.warn(`[screenshot-session] failed to read Firefox profile cookies: ${error.message}`);
+    return [];
+  });
+  if (firefoxCookies.length) {
+    return normalizeCookiesForPuppeteer(firefoxCookies, normalizeHttpUrl(startUrl) || "https://www.youtube.com/");
+  }
+
+  const cookiesPath = String(process.env.SCREENSHOT_COOKIES_PATH || process.env.MEDIA_COOKIES_PATH || "").trim();
+  if (!cookiesPath) return [];
+  const rawCookies = await loadCookiesFromPath(cookiesPath);
+  return normalizeCookiesForPuppeteer(rawCookies, normalizeHttpUrl(startUrl) || "https://www.youtube.com/");
+}
+
+async function importCookiesIntoBrowserSession(startUrl = "") {
+  const cookies = await loadBrowserSessionCookies(startUrl);
+  if (!cookies.length) return { imported: 0 };
+
+  const puppeteer = await puppeteerModule();
+  const browser = await puppeteer.connect({ browserWSEndpoint: await browserSessionWebSocketEndpoint() });
+  try {
+    const pages = await browser.pages();
+    const page = pages[0] || await browser.newPage();
+    await page.setCookie(...cookies);
+    const url = normalizeHttpUrl(startUrl);
+    if (url) {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => page.reload({ waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => null));
+    }
+    return { imported: cookies.length };
+  } finally {
+    browser.disconnect();
+  }
+}
+
+async function commandExists(command) {
+  const paths = String(process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  for (const dir of paths) {
+    if (await pathExists(path.join(dir, command))) return true;
+  }
+  return false;
+}
+
+async function canStartHeadedBrowserSession() {
+  return await commandExists("Xvfb") && await commandExists("x11vnc") && await commandExists("websockify");
+}
+
+function attachBrowserSessionLogs(child, label, updateRecentError) {
+  child.stderr?.on("data", (chunk) => {
+    updateRecentError(`[${label}] ${chunk.toString("utf8")}`);
+  });
+  child.on("error", (error) => updateRecentError(`[${label}] ${error.message}`));
+}
+
+async function startScreenshotBrowserSession(res, startUrl = "") {
+  const current = browserSessionStatus();
+  if (current.running) {
+    json(res, 200, current);
+    return;
+  }
+  await fs.mkdir(SCREENSHOT_BROWSER_PROFILE_DIR, { recursive: true });
+  await removeStaleChromeProfileLocks(SCREENSHOT_BROWSER_PROFILE_DIR);
+  const executable = await puppeteerExecutablePath();
+  const startAsHeaded = await canStartHeadedBrowserSession();
+  const auxProcesses = [];
+  const display = ":99";
+  let recentError = "";
+  const updateRecentError = (message) => {
+    recentError = `${recentError}${message}`.slice(-2000);
+    if (screenshotBrowserSession) screenshotBrowserSession.recentError = recentError;
+  };
+  if (startAsHeaded) {
+    auxProcesses.push(spawn("Xvfb", [display, "-screen", "0", "1920x1080x24", "-nolisten", "tcp"], {
+      cwd: __dirname,
+      env: process.env,
+      windowsHide: true,
+      stdio: ["ignore", "ignore", "pipe"]
+    }));
+    attachBrowserSessionLogs(auxProcesses.at(-1), "xvfb", updateRecentError);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    auxProcesses.push(spawn("openbox", [], {
+      cwd: __dirname,
+      env: { ...process.env, DISPLAY: display },
+      windowsHide: true,
+      stdio: ["ignore", "ignore", "pipe"]
+    }));
+    attachBrowserSessionLogs(auxProcesses.at(-1), "openbox", updateRecentError);
+    auxProcesses.push(spawn("x11vnc", ["-display", display, "-forever", "-shared", "-nopw", "-rfbport", String(SCREENSHOT_VNC_PORT)], {
+      cwd: __dirname,
+      env: process.env,
+      windowsHide: true,
+      stdio: ["ignore", "ignore", "pipe"]
+    }));
+    attachBrowserSessionLogs(auxProcesses.at(-1), "x11vnc", updateRecentError);
+    auxProcesses.push(spawn("websockify", ["--web=/usr/share/novnc", String(SCREENSHOT_NOVNC_PORT), `localhost:${SCREENSHOT_VNC_PORT}`], {
+      cwd: __dirname,
+      env: process.env,
+      windowsHide: true,
+      stdio: ["ignore", "ignore", "pipe"]
+    }));
+    attachBrowserSessionLogs(auxProcesses.at(-1), "websockify", updateRecentError);
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  const child = spawn(executable, [
+    ...(startAsHeaded ? [] : ["--headless=new"]),
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--lang=ru-RU",
+    "--remote-debugging-address=0.0.0.0",
+    `--remote-debugging-port=${SCREENSHOT_REMOTE_DEBUGGING_PORT}`,
+    "--remote-allow-origins=*",
+    `--user-data-dir=${SCREENSHOT_BROWSER_PROFILE_DIR}`,
+    normalizeHttpUrl(startUrl) || "about:blank"
+  ], {
+    cwd: __dirname,
+    env: { ...process.env, LANG: "ru_RU.UTF-8", ...(startAsHeaded ? { DISPLAY: display } : {}) },
+    windowsHide: true,
+    stdio: ["ignore", "ignore", "pipe"]
+  });
+  attachBrowserSessionLogs(child, "chrome", updateRecentError);
+  child.on("exit", () => {
+    screenshotBrowserLastError = recentError;
+    for (const proc of auxProcesses) {
+      if (proc.exitCode === null) proc.kill("SIGTERM");
+    }
+    screenshotBrowserSession = null;
+  });
+  screenshotBrowserSession = {
+    process: child,
+    auxProcesses,
+    startedAt: new Date().toISOString(),
+    recentError,
+    devtoolsUrl: "",
+    vncUrl: startAsHeaded ? `http://localhost:${SCREENSHOT_NOVNC_PORT}/vnc.html?autoconnect=true&resize=scale&path=websockify` : ""
+  };
+  setTimeout(() => {
+    if (child.exitCode !== null) screenshotBrowserSession = null;
+  }, 500).unref?.();
+  try {
+    const target = await waitForDevToolsTarget();
+    if (screenshotBrowserSession) screenshotBrowserSession.devtoolsUrl = target.devtoolsUrl;
+    const cookieResult = await importCookiesIntoBrowserSession(startUrl);
+    if (cookieResult.imported) {
+      console.log(`[screenshot-session] imported ${cookieResult.imported} cookies into Docker Chrome session`);
+    }
+  } catch (error) {
+    screenshotBrowserLastError = error.message;
+    if (screenshotBrowserSession) screenshotBrowserSession.recentError = `${screenshotBrowserSession.recentError || ""}\n${error.message}`.trim();
+  }
+  json(res, 200, browserSessionStatus());
+}
+
+function waitForProcessExit(proc, timeoutMs) {
+  if (!proc || proc.exitCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    proc.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+async function stopScreenshotBrowserSessionProcess() {
+  const proc = screenshotBrowserSession?.process || null;
+  const auxProcesses = Array.isArray(screenshotBrowserSession?.auxProcesses) ? screenshotBrowserSession.auxProcesses : [];
+  if (proc && proc.exitCode === null) {
+    proc.kill("SIGTERM");
+    await waitForProcessExit(proc, 1500);
+    if (proc.exitCode === null) {
+      proc.kill("SIGKILL");
+      await waitForProcessExit(proc, 1500);
+    }
+  }
+  for (const aux of auxProcesses) {
+    if (aux?.exitCode !== null) continue;
+    aux.kill("SIGTERM");
+    await waitForProcessExit(aux, 800);
+    if (aux.exitCode === null) aux.kill("SIGKILL");
+  }
+  screenshotBrowserSession = null;
+  await removeStaleChromeProfileLocks(SCREENSHOT_BROWSER_PROFILE_DIR);
+  return browserSessionStatus();
+}
+
+async function stopScreenshotBrowserSession(res) {
+  const status = await stopScreenshotBrowserSessionProcess();
+  json(res, 200, status);
+}
+
 function normalizeVkDownloadUrl(rawUrl) {
   try {
     const parsed = new URL(rawUrl);
@@ -1088,6 +1644,24 @@ function isXOrTwitter(urlStr) {
     const parsed = new URL(urlStr);
     const host = parsed.hostname.toLowerCase();
     return host === "x.com" || host === "twitter.com" || host.endsWith(".x.com") || host.endsWith(".twitter.com");
+  } catch {
+    return false;
+  }
+}
+
+function isInstagramUrl(urlStr) {
+  try {
+    const host = new URL(urlStr).hostname.toLowerCase().replace(/^www\./, "");
+    return host === "instagram.com" || host.endsWith(".instagram.com");
+  } catch {
+    return false;
+  }
+}
+
+function isYouTubeUrl(urlStr) {
+  try {
+    const host = new URL(urlStr).hostname.toLowerCase().replace(/^www\./, "");
+    return host === "youtube.com" || host === "youtu.be" || host.endsWith(".youtube.com");
   } catch {
     return false;
   }
@@ -1131,9 +1705,11 @@ async function listNewOutputFiles(topic, dir, beforeFiles) {
   for (const file of newFiles) {
     const relDir = path.dirname(file.name);
     const sourceDir = relDir === "." ? dir : path.join(dir, relDir);
-    const nextBase = await normalizeMediaFileNameOnDisk(sourceDir, path.basename(file.name));
+    let nextBase = await normalizeMediaFileNameOnDisk(sourceDir, path.basename(file.name));
+    nextBase = await ensurePremiereFriendlyVideoOnDisk(sourceDir, nextBase);
     const nextName = relDir === "." ? nextBase : path.join(relDir, nextBase);
     const absolutePath = path.join(dir, nextName);
+    await verifyDownloadedMediaIntegrityOnDisk(absolutePath, path.basename(nextName));
     const stats = await fs.stat(absolutePath).catch(() => null);
     if (!stats?.isFile()) continue;
     normalizedFiles.push({
@@ -1183,26 +1759,30 @@ function firstMetadataValue(flat, patterns) {
 
 function applyDownloadedMetadata(job, metadata = {}) {
   const flat = flattenMetadataValues(metadata);
-  const title = firstMetadataValue(flat, [
+  const socialText = firstMetadataValue(flat, [
+    /(^|\.)(full_text|fulltext|tweet_text|tweettext|content|message)$/i
+  ]);
+  const title = socialText || firstMetadataValue(flat, [
     /(^|\.)title$/i,
     /(^|\.)caption$/i,
     /(^|\.)text$/i
   ]);
-  const description = firstMetadataValue(flat, [
+  const description = socialText || firstMetadataValue(flat, [
     /(^|\.)description$/i,
     /(^|\.)desc$/i,
     /(^|\.)caption$/i,
-    /(^|\.)text$/i
+    /(^|\.)text$/i,
+    /(^|\.)(full_text|fulltext|tweet_text|tweettext|content|message)$/i
   ]);
   const uploader = firstMetadataValue(flat, [
     /(^|\.)(uploader|username|unique_id|uniqueid|screen_name|nickname|author)$/i,
-    /author\.(username|unique_id|uniqueid|nickname)$/i,
-    /user\.(username|unique_id|uniqueid|nickname)$/i
+    /author\.(username|unique_id|uniqueid|nickname|nick|name)$/i,
+    /user\.(username|unique_id|uniqueid|nickname|nick|name)$/i
   ]);
   const uploaderUrl = firstMetadataValue(flat, [
     /(^|\.)(uploader_url|author_url|user_url|profile_url)$/i
   ]);
-  const webpageUrl = firstMetadataValue(flat, [
+  const webpageUrl = isXOrTwitter(job?.url) ? job.url : firstMetadataValue(flat, [
     /(^|\.)(webpage_url|post_url|url|source_url)$/i
   ]);
   const width = Number(firstMetadataValue(flat, [/(^|\.)width$/i]) || 0) || 0;
@@ -1379,6 +1959,13 @@ function normalizeYtDlpMetaValue(value) {
   return text;
 }
 
+function looksGenericSocialMetadata(value) {
+  const normalized = normalizeYtDlpMetaValue(value).toLowerCase().replace(/[«»"']/g, "").trim();
+  return [
+    "\u0432\u0441\u0435\u0433\u0434\u0430 \u0432 \u0440\u0435\u0430\u043b\u044c\u043d\u043e\u043c \u0432\u0440\u0435\u043c\u0435\u043d\u0438"
+  ].includes(normalized);
+}
+
 function parseYtDlpMetadataLine(job, textChunk) {
   const lines = String(textChunk ?? "").split(/\r?\n/);
   const pairs = [
@@ -1445,6 +2032,9 @@ function runCommand(job, command, args, options = {}) {
       parseYtDlpMetadataLine(job, textChunk);
       const progress = parseDownloadProgress(textChunk);
       if (progress !== null) updateJob(job, { progress, log: output.slice(-2000) });
+      else if (/(\bERROR\b|\bWARNING\b|failed|unable|unavailable|network|cookie|sign in|not a bot|requested format)/i.test(textChunk)) {
+        updateJob(job, { log: output.slice(-2000) });
+      }
     };
     child.stdout.on("data", onData);
     child.stderr.on("data", onData);
@@ -1471,9 +2061,106 @@ function runCommand(job, command, args, options = {}) {
   });
 }
 
+function parseDownloaderExtraArgs(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return [];
+  if (raw.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.map((item) => String(item)).filter(Boolean) : [];
+    } catch {
+      return [];
+    }
+  }
+  const matches = raw.match(/"([^"]*)"|'([^']*)'|[^\s]+/g) || [];
+  return matches.map((item) => item.replace(/^"|"$/g, "").replace(/^'|'$/g, "")).filter(Boolean);
+}
+
+function ytDlpJsRuntimeArgs() {
+  const defaultRuntime = existsSync("/usr/local/bin/deno") ? "deno:/usr/local/bin/deno" : "node";
+  const runtime = String(process.env.MEDIA_YTDLP_JS_RUNTIME || defaultRuntime).trim();
+  if (!runtime || /^(0|false|off|none)$/i.test(runtime)) return [];
+  return ["--js-runtimes", runtime];
+}
+
+function dockerBrowserCookiesFromBrowserArg() {
+  const cookiesDb = path.join(SCREENSHOT_BROWSER_PROFILE_DIR, "Default", "Cookies");
+  if (!existsSync(cookiesDb)) return "";
+  return `chrome:${SCREENSHOT_BROWSER_PROFILE_DIR}`;
+}
+
+function dockerFirefoxCookiesFromBrowserArg() {
+  const profileDir = path.join(RUNTIME_DATA_ROOT, "firefox-profile");
+  const cookiesDb = path.join(profileDir, "cookies.sqlite");
+  if (!existsSync(cookiesDb)) return "";
+  return `firefox:${profileDir}`;
+}
+
+function applyYtDlpSharedArgs(args, insertIndex = args.length) {
+  const cookiesPath = String(process.env.MEDIA_COOKIES_PATH || process.env.SCREENSHOT_COOKIES_PATH || "").trim();
+  const cookiesFromBrowser = String(process.env.MEDIA_COOKIES_FROM_BROWSER || "").trim();
+  const dockerFirefoxCookies = !cookiesFromBrowser ? dockerFirefoxCookiesFromBrowserArg() : "";
+  const dockerCookiesFromBrowser = !cookiesPath && !cookiesFromBrowser ? dockerBrowserCookiesFromBrowserArg() : "";
+  const extraArgs = parseDownloaderExtraArgs(process.env.MEDIA_YTDLP_EXTRA_ARGS);
+  const shared = [];
+  if (cookiesPath) shared.push("--cookies", cookiesPath);
+  else if (cookiesFromBrowser) shared.push("--cookies-from-browser", cookiesFromBrowser);
+  else if (dockerFirefoxCookies) shared.push("--cookies-from-browser", dockerFirefoxCookies);
+  else if (dockerCookiesFromBrowser) shared.push("--cookies-from-browser", dockerCookiesFromBrowser);
+  shared.push(...extraArgs);
+  if (shared.length) args.splice(insertIndex, 0, ...shared);
+}
+
+function galleryDlCookieArgs({ preferBrowser = false } = {}) {
+  const cookiesPath = String(process.env.MEDIA_COOKIES_PATH || process.env.SCREENSHOT_COOKIES_PATH || "").trim();
+  const cookiesFromBrowser = String(process.env.MEDIA_COOKIES_FROM_BROWSER || "").trim();
+  const dockerFirefoxCookies = !cookiesFromBrowser ? dockerFirefoxCookiesFromBrowserArg() : "";
+  const dockerCookiesFromBrowser = !cookiesPath && !cookiesFromBrowser ? dockerBrowserCookiesFromBrowserArg() : "";
+  const browserSource = cookiesFromBrowser || dockerFirefoxCookies || dockerCookiesFromBrowser;
+  if (preferBrowser && browserSource) return ["--cookies-from-browser", browserSource];
+  if (cookiesPath) return ["--cookies", cookiesPath];
+  if (browserSource) return ["--cookies-from-browser", browserSource];
+  return [];
+}
+
+function applyGalleryDlSharedArgs(args, insertIndex = args.length, options = {}) {
+  const shared = galleryDlCookieArgs(options);
+  if (shared.length) args.splice(insertIndex, 0, ...shared);
+}
+
+function isDownloaderAuthCookieError(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return Boolean(message) && (
+    message.includes("sign in to confirm") ||
+    message.includes("sign in to verify") ||
+    message.includes("confirm you're not a bot") ||
+    message.includes("confirm you are not a bot") ||
+    message.includes("not a bot") ||
+    message.includes("bot verification") ||
+    message.includes("use --cookies") ||
+    message.includes("cookies-from-browser") ||
+    message.includes("login required") ||
+    message.includes("private video")
+  );
+}
+
+function downloaderCookieHelpMessage(url = "") {
+  const host = (() => {
+    try {
+      return new URL(String(url || "")).hostname.replace(/^www\./i, "");
+    } catch {
+      return "this site";
+    }
+  })();
+  return `${host} needs browser cookies / anti-bot verification. Open Screenshot Lab Session, log in inside Docker Chrome, stop the session, then retry. You can also set MEDIA_COOKIES_PATH=/app/data/cookies.txt.`;
+}
+
+const DIRECT_DOWNLOAD_RESPONSE_TIMEOUT_MS = 60_000;
+const DIRECT_DOWNLOAD_STALL_TIMEOUT_MS = 90_000;
+
 async function downloadDirectFile(job, url, topic, dir, nameHint = "", requestHeaders = {}) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 60000);
+  const timer = setTimeout(() => controller.abort(), DIRECT_DOWNLOAD_RESPONSE_TIMEOUT_MS);
   const response = await fetch(url, {
     redirect: "follow",
     signal: controller.signal,
@@ -1495,8 +2182,14 @@ async function downloadDirectFile(job, url, topic, dir, nameHint = "", requestHe
   const fileName = await ensureUniqueFileNameInDir(dir, makeFileNameUnique(rawFileName));
   const target = path.join(dir, fileName);
   let received = 0;
+  let stallTimer = null;
+  const resetStallTimer = () => {
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => controller.abort(), DIRECT_DOWNLOAD_STALL_TIMEOUT_MS);
+  };
   const limiter = new Transform({
     transform(chunk, encoding, callback) {
+      resetStallTimer();
       received += chunk.length;
       if (received > MEDIA_DOWNLOAD_MAX_BYTES) {
         callback(new Error(`Direct download exceeds ${Math.round(MEDIA_DOWNLOAD_MAX_BYTES / 1024 / 1024)} MB limit`));
@@ -1508,10 +2201,13 @@ async function downloadDirectFile(job, url, topic, dir, nameHint = "", requestHe
   });
   try {
     if (!response.body) throw new Error("Direct download response has no body");
+    resetStallTimer();
     await pipeline(Readable.fromWeb(response.body), limiter, createWriteStream(target));
   } catch (error) {
     await fs.unlink(target).catch(() => null);
     throw error;
+  } finally {
+    clearTimeout(stallTimer);
   }
   const normalizedName = await normalizeMediaFileNameOnDisk(dir, fileName);
   const normalizedPath = path.join(dir, normalizedName);
@@ -1640,20 +2336,38 @@ async function discoverFallbackVideo(pageUrl) {
   }
 }
 
+async function screenshotEngineArgs({ url, width, height, zoom, scroll = "", timeoutMs }) {
+  await fs.mkdir(SCREENSHOT_BROWSER_PROFILE_DIR, { recursive: true });
+  const args = [
+    path.join(__dirname, "tools", "screenshot-engine", "link-screenshot.js"),
+    "--url", url,
+    "--width", String(width),
+    "--height", String(height),
+    "--zoom", String(zoom),
+    "--timeout_ms", String(timeoutMs),
+    "--user_data_dir", SCREENSHOT_BROWSER_PROFILE_DIR
+  ];
+  if (scroll !== "" && scroll !== null && scroll !== undefined) {
+    args.push("--scroll", String(scroll));
+  }
+  const cookiesPath = String(process.env.SCREENSHOT_COOKIES_PATH || process.env.MEDIA_COOKIES_PATH || "").trim();
+  if (cookiesPath) args.push("--cookies_path", cookiesPath);
+  return args;
+}
+
 async function captureDownloadFallbackScreenshot(job, pageUrl, topic, dir) {
   const scriptPath = path.join(__dirname, "tools", "screenshot-engine", "link-screenshot.js");
   if (!(await pathExists(scriptPath))) throw new Error("Screenshot engine is unavailable");
   const host = asciiFilePart(new URL(pageUrl).hostname, "page");
   const fileName = await ensureUniqueFileNameInDir(dir, `download_fallback_${host}.png`);
   const target = path.join(dir, fileName);
-  const { stdout } = await execFileAsync(process.execPath, [
-    scriptPath,
-    "--url", pageUrl,
-    "--width", "1920",
-    "--height", "1080",
-    "--zoom", "100",
-    "--timeout_ms", "30000"
-  ], { windowsHide: true, timeout: 45000, encoding: "buffer", maxBuffer: 24 * 1024 * 1024 });
+  const { stdout } = await execFileAsync(process.execPath, await screenshotEngineArgs({
+    url: pageUrl,
+    width: "1920",
+    height: "1080",
+    zoom: "100",
+    timeoutMs: "30000"
+  }), { windowsHide: true, timeout: 45000, encoding: "buffer", maxBuffer: 24 * 1024 * 1024 });
   if (!Buffer.isBuffer(stdout) || stdout.length < 1024) throw new Error("Screenshot engine returned no image");
   await fs.writeFile(target, stdout);
   const relPath = path.join(topic, fileName).split(path.sep).join("/");
@@ -1686,7 +2400,9 @@ async function runYtDlpDownload(job, tools, url, dir) {
     : DEFAULT_YTDLP_FORMAT;
   const args = [
     "--newline",
+    "--progress",
     "--no-update",
+    "--force-ipv4",
     "--no-mtime",
     "--no-playlist",
     "--playlist-end", "1",
@@ -1697,7 +2413,7 @@ async function runYtDlpDownload(job, tools, url, dir) {
     "--match-filter", "!is_live",
     "--windows-filenames",
     "--restrict-filenames",
-    "--js-runtimes", "node",
+    ...ytDlpJsRuntimeArgs(),
     "--remote-components", "ejs:github",
     "--print",
     "before_dl:__META_TITLE__%(title)s",
@@ -1721,10 +2437,7 @@ async function runYtDlpDownload(job, tools, url, dir) {
     outputTemplate,
     url
   ];
-  const cookiesPath = String(process.env.MEDIA_COOKIES_PATH || "").trim();
-  const cookiesFromBrowser = String(process.env.MEDIA_COOKIES_FROM_BROWSER || "").trim();
-  if (cookiesPath) args.splice(args.length - 1, 0, "--cookies", cookiesPath);
-  else if (cookiesFromBrowser) args.splice(args.length - 1, 0, "--cookies-from-browser", cookiesFromBrowser);
+  applyYtDlpSharedArgs(args, args.length - 1);
   if (tools.ffmpeg_path && (tools.ffmpeg_path.includes("/") || tools.ffmpeg_path.includes("\\"))) {
     args.splice(args.length - 1, 0, "--ffmpeg-location", path.dirname(tools.ffmpeg_path));
   }
@@ -1733,9 +2446,13 @@ async function runYtDlpDownload(job, tools, url, dir) {
 
 async function runGalleryDlDownload(job, tools, url, dir, options = {}) {
   if (!tools.gallery_dl_path) throw new Error("gallery-dl is not available");
-  const galleryArgs = ["--range", "1", "--post-range", "1", "--write-metadata"];
+  const galleryArgs = [];
+  if (options.range !== false) galleryArgs.push("--range", String(options.range || "1"));
+  if (options.postRange !== false) galleryArgs.push("--post-range", "1");
+  galleryArgs.push("--write-metadata");
   if (options.childRange) galleryArgs.push("--child-range", String(options.childRange));
   galleryArgs.push("--filesize-max", "1G", "-D", dir, url);
+  applyGalleryDlSharedArgs(galleryArgs, galleryArgs.length - 1, options);
   const args = tools.gallery_dl_mode === "python_module"
     ? ["-m", "gallery_dl", ...galleryArgs]
     : galleryArgs;
@@ -1746,11 +2463,12 @@ async function getYtDlpDirectUrl(job, tools, url, formatSelector) {
   if (!tools.yt_dlp_path) throw new Error("yt-dlp is not available");
   const args = [
     "--no-update",
+    "--force-ipv4",
     "--no-playlist",
     "--playlist-end", "1",
     "--socket-timeout", "30",
     "--retries", "3",
-    "--js-runtimes", "node",
+    ...ytDlpJsRuntimeArgs(),
     "--remote-components", "ejs:github",
     "--print", "__META_TITLE__%(title)s",
     "--print", "__META_DESCRIPTION__%(description)s",
@@ -1763,10 +2481,7 @@ async function getYtDlpDirectUrl(job, tools, url, formatSelector) {
     "--get-url",
     url
   ];
-  const cookiesPath = String(process.env.MEDIA_COOKIES_PATH || "").trim();
-  const cookiesFromBrowser = String(process.env.MEDIA_COOKIES_FROM_BROWSER || "").trim();
-  if (cookiesPath) args.splice(args.length - 1, 0, "--cookies", cookiesPath);
-  else if (cookiesFromBrowser) args.splice(args.length - 1, 0, "--cookies-from-browser", cookiesFromBrowser);
+  applyYtDlpSharedArgs(args, args.length - 1);
   const output = await runCommand(job, tools.yt_dlp_path, args, { cwd: process.cwd() });
   const urls = String(output || "").split(/\r?\n/).map((line) => line.trim()).filter((line) => /^https?:\/\//i.test(line));
   return urls[urls.length - 1] || "";
@@ -1800,6 +2515,35 @@ async function executeMediaDownload(job) {
     let ytDlpError = null;
     let galleryDlError = null;
 
+    if (isInstagramUrl(job.url) && tools.gallery_dl_path) {
+      try {
+        updateJob(job, { stage: "instagram_gallery", progress: 0 });
+        await runGalleryDlDownload(job, tools, job.url, dir, { range: false, postRange: false, preferBrowser: true });
+        await removeNewStandaloneAudioFiles(dir, before);
+        await applyGalleryMetadataSidecars(job, dir);
+        const afterGalleryPrimary = await listNewOutputFiles(safeTopic, dir, before);
+        downloadSucceeded = afterGalleryPrimary.length > 0;
+      } catch (error) {
+        galleryDlError = error;
+        updateJob(job, { log: `${job.log || ""}\ngallery-dl Instagram primary failed: ${error.message}`.slice(-2000) });
+      }
+    }
+
+    if (isXOrTwitter(job.url) && tools.gallery_dl_path) {
+      try {
+        updateJob(job, { stage: "twitter_gallery", progress: 0 });
+        await runGalleryDlDownload(job, tools, job.url, dir, { range: false, childRange: "1-10", postRange: false });
+        await removeNewStandaloneAudioFiles(dir, before);
+        await applyGalleryMetadataSidecars(job, dir);
+        await pruneLowerQualityDuplicateVideos(job, dir, before);
+        const afterGalleryPrimary = await listNewOutputFiles(safeTopic, dir, before);
+        downloadSucceeded = afterGalleryPrimary.length > 0;
+      } catch (error) {
+        galleryDlError = error;
+        updateJob(job, { log: `${job.log || ""}\ngallery-dl primary failed: ${error.message}`.slice(-2000) });
+      }
+    }
+
     if (isVkDownloadUrl(job.url)) {
       updateJob(job, { stage: "vk_direct", progress: 0 });
       try {
@@ -1820,7 +2564,7 @@ async function executeMediaDownload(job) {
       }
     }
 
-    try {
+    if (!downloadSucceeded) try {
       await runYtDlpDownload(job, tools, job.url, dir);
       await removeNewStandaloneAudioFiles(dir, before);
       const afterYt = await listNewOutputFiles(safeTopic, dir, before);
@@ -1829,7 +2573,7 @@ async function executeMediaDownload(job) {
         if (isXOrTwitter(job.url) && tools.gallery_dl_path) {
           try {
             updateJob(job, { stage: "twitter_quality_compare" });
-            await runGalleryDlDownload(job, tools, job.url, dir, { childRange: "1-10" });
+            await runGalleryDlDownload(job, tools, job.url, dir, { range: false, childRange: "1-10" });
             await removeNewStandaloneAudioFiles(dir, before);
             await applyGalleryMetadataSidecars(job, dir);
             await pruneLowerQualityDuplicateVideos(job, dir, before);
@@ -1849,7 +2593,7 @@ async function executeMediaDownload(job) {
       const reason = ytDlpError ? ytDlpError.message : "no files produced";
       updateJob(job, { log: `${job.log || ""}\nyt-dlp failed or got no media (${reason}), trying gallery-dl fallback...`.slice(-2000) });
       try {
-        await runGalleryDlDownload(job, tools, job.url, dir, { childRange: isXOrTwitter(job.url) ? "1-10" : "1" });
+        await runGalleryDlDownload(job, tools, job.url, dir, { range: isXOrTwitter(job.url) ? false : "1", childRange: isXOrTwitter(job.url) ? "1-10" : "1" });
         await removeNewStandaloneAudioFiles(dir, before);
         await applyGalleryMetadataSidecars(job, dir);
         const afterGallery = await listNewOutputFiles(safeTopic, dir, before);
@@ -1884,6 +2628,9 @@ async function executeMediaDownload(job) {
     }
 
     if (!downloadSucceeded) {
+      if (isDownloaderAuthCookieError(ytDlpError) || isDownloaderAuthCookieError(galleryDlError)) {
+        throw new Error(downloaderCookieHelpMessage(job.url));
+      }
       updateJob(job, { stage: "fallback_screenshot", progress: 0 });
       if (job.capture_fallback_screenshot) {
         try {
@@ -2548,9 +3295,24 @@ function assignSegmentIds(content, previousSegments = []) {
 function preserveEnrichedLinkSegments(content, previousSegments = []) {
   const lines = String(content ?? "").replace(/\r\n/g, "\n").split("\n");
   const existingUrls = new Set(lines.map((line) => normalizeHttpUrl(line)).filter(Boolean));
-  const candidates = (Array.isArray(previousSegments) ? previousSegments : [])
-    .filter((segment) => (segment.kind === "link" || segment.type === "link"))
-    .map((segment) => ({ url: normalizeHttpUrl(segment.text), topic: String(segment.topic || "").trim() }))
+  const orderedSegments = Array.isArray(previousSegments) ? previousSegments : [];
+  const localLinkLabelFor = (segment, index) => {
+    const previous = orderedSegments[index - 1];
+    if (!previous || String(previous.topic || "").trim() !== String(segment.topic || "").trim()) return "";
+    if ((previous.kind || previous.type) === "link") return "";
+    const text = String(previous.text || "").trim();
+    if (!text || text.includes("\n") || text.length > 220) return "";
+    if (!/^[^:：]{1,80}[:：]\s+\S/.test(text)) return "";
+    return text;
+  };
+  const candidates = orderedSegments
+    .map((segment, index) => ({ segment, index }))
+    .filter(({ segment }) => (segment.kind === "link" || segment.type === "link"))
+    .map(({ segment, index }) => ({
+      url: normalizeHttpUrl(segment.text),
+      topic: String(segment.topic || "").trim(),
+      label: localLinkLabelFor(segment, index)
+    }))
     .filter((item) => item.url && !existingUrls.has(item.url));
   const preserved = [];
   for (const candidate of candidates) {
@@ -2558,18 +3320,82 @@ function preserveEnrichedLinkSegments(content, previousSegments = []) {
       const match = line.match(/^#{2,6}\s+(.+?)\s*$/);
       return match && normalizeTextForMatch(match[1]) === normalizeTextForMatch(candidate.topic);
     });
+    const insertion = candidate.label ? [candidate.label, "", candidate.url, ""] : [candidate.url, ""];
     if (headingIndex >= 0) {
       let insertAt = headingIndex + 1;
       while (insertAt < lines.length && !lines[insertAt].trim()) insertAt += 1;
-      lines.splice(insertAt, 0, candidate.url, "");
+      lines.splice(insertAt, 0, ...insertion);
     } else if (candidate.topic) {
       if (lines.length && lines.at(-1)?.trim()) lines.push("");
-      lines.push(`### ${candidate.topic}`, "", candidate.url);
+      lines.push(`### ${candidate.topic}`, "", ...insertion);
     } else {
-      lines.push("", candidate.url);
+      lines.push("", ...insertion);
     }
     existingUrls.add(candidate.url);
-    preserved.push(candidate.url);
+    preserved.push(candidate.label ? { url: candidate.url, label: candidate.label } : candidate.url);
+  }
+  return { content: lines.join("\n"), preserved };
+}
+
+function isEditorialSegment(segment) {
+  const text = String(segment?.text || "").trim();
+  if (!text) return false;
+  return text.startsWith("/") || segment?.editorial === true || segment?.local_only === true;
+}
+
+function findHeadingLine(lines, topic) {
+  const topicKey = normalizeTextForMatch(topic);
+  if (!topicKey) return -1;
+  return lines.findIndex((line) => {
+    const match = String(line ?? "").match(/^#{2,6}\s+(.+?)\s*$/);
+    return match && normalizeTextForMatch(match[1]) === topicKey;
+  });
+}
+
+function nextHeadingLine(lines, startIndex) {
+  for (let index = Math.max(0, startIndex + 1); index < lines.length; index += 1) {
+    if (/^#{2,6}\s+\S/.test(String(lines[index] ?? ""))) return index;
+  }
+  return lines.length;
+}
+
+function insertLocalEditorialLine(lines, segment) {
+  const topic = String(segment?.topic || "").trim();
+  const text = String(segment?.text || "").trim();
+  if (!text) return;
+  let headingIndex = findHeadingLine(lines, topic);
+  if (headingIndex < 0) {
+    if (lines.length && String(lines.at(-1) ?? "").trim()) lines.push("");
+    if (topic) {
+      lines.push(`### ${topic}`, "");
+      headingIndex = lines.length - 2;
+    } else {
+      lines.push(text, "");
+      return;
+    }
+  }
+  const sectionEnd = nextHeadingLine(lines, headingIndex);
+  const insertAt = sectionEnd;
+  const before = lines[insertAt - 1];
+  const insertion = [];
+  if (insertAt > 0 && String(before ?? "").trim()) insertion.push("");
+  insertion.push(text, "");
+  lines.splice(insertAt, 0, ...insertion);
+}
+
+function preserveEditorialSegments(content, previousSegments = []) {
+  const lines = String(content ?? "").replace(/\r\n/g, "\n").split("\n");
+  const parsed = parseContentSegments(content);
+  const existingKeys = new Set(parsed.map((segment) => segmentMatchKey(segment, true)));
+  const usedTextKeys = new Set(parsed.map((segment) => `${normalizeTextForMatch(segment.topic)}\n${normalizeTextForMatch(segment.text)}`));
+  const preserved = [];
+  const candidates = (Array.isArray(previousSegments) ? previousSegments : []).filter(isEditorialSegment);
+  for (const segment of candidates) {
+    const textKey = `${normalizeTextForMatch(segment.topic)}\n${normalizeTextForMatch(segment.text)}`;
+    if (!textKey.trim() || usedTextKeys.has(textKey) || existingKeys.has(segmentMatchKey(segment, true))) continue;
+    insertLocalEditorialLine(lines, segment);
+    usedTextKeys.add(textKey);
+    preserved.push({ id: segment.id || "", topic: segment.topic || "", text: segment.text || "" });
   }
   return { content: lines.join("\n"), preserved };
 }
@@ -3014,22 +3840,31 @@ function cleanRemotionLongText(value, maxLength = 1800) {
   return String(value ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim().slice(0, maxLength);
 }
 
+function cleanRemotionAssetInput(value) {
+  const raw = cleanRemotionText(value, 600);
+  if (!raw) return "";
+  if (/^(?:без файла|нет|none|null|no|empty|пусто|очистить)$/i.test(raw)) return "";
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (/[\\/]/.test(raw) || /\.[a-z0-9]{2,5}(?:[?#].*)?$/i.test(raw)) return raw;
+  return "";
+}
+
 function remotionMediaAssetRef(value) {
-  const raw = String(value ?? "").trim();
+  const raw = cleanRemotionAssetInput(value);
   if (!raw) return "";
   if (/^https?:\/\//i.test(raw)) return raw;
-  let relPath = raw;
+  let relPath = cleanHostPrefix(raw);
   try {
     const parsed = new URL(raw, `http://127.0.0.1:${PORT}`);
     if (parsed.pathname === "/api/media/raw") {
-      relPath = parsed.searchParams.get("path") || "";
+      relPath = cleanHostPrefix(parsed.searchParams.get("path") || "");
     } else if (/^https?:\/\//i.test(raw)) {
       return raw;
     }
   } catch {
     // keep raw value
   }
-  relPath = relPath.replace(/^\/+/, "").replace(/^media\//i, "");
+  relPath = normalizeMediaFilePath(relPath).replace(/^\/+/, "").replace(/^media\//i, "");
   if (!relPath) return "";
   if (!/[\\/]/.test(relPath) && !/\.[a-z0-9]{2,5}$/i.test(relPath)) return "";
   const absolutePath = safeResolveMediaPathForRoot(PAMPAM_ROOT, relPath);
@@ -3047,8 +3882,14 @@ function buildRemotionProps(body = {}) {
   const label = cleanRemotionText(props.label || body.label, 80);
   const textScaleRaw = Number(props.textScale || props.text_scale || body.textScale || body.text_scale || 1);
   const textScale = Number.isFinite(textScaleRaw) ? Math.max(0.72, Math.min(1.38, textScaleRaw)) : 1;
+  const lineHeightScaleRaw = Number(props.lineHeightScale || props.line_height_scale || body.lineHeightScale || body.line_height_scale || 1);
+  const lineHeightScale = Number.isFinite(lineHeightScaleRaw) ? Math.max(0.72, Math.min(1.5, lineHeightScaleRaw)) : 1;
   const highlightDelayRaw = Number(props.highlightDelaySeconds || props.highlight_delay_seconds || body.highlightDelaySeconds || body.highlight_delay_seconds || 1.35);
   const highlightDelaySeconds = Number.isFinite(highlightDelayRaw) ? Math.max(0, Math.min(12, highlightDelayRaw)) : 1.35;
+  const highlightDurationRaw = Number(props.highlightDurationSeconds || props.highlight_duration_seconds || body.highlightDurationSeconds || body.highlight_duration_seconds || 1.05);
+  const highlightDurationSeconds = Number.isFinite(highlightDurationRaw) ? Math.max(0.1, Math.min(10, highlightDurationRaw)) : 1.05;
+  const highlightStaggerRaw = Number(props.highlightStaggerSeconds || props.highlight_stagger_seconds || body.highlightStaggerSeconds || body.highlight_stagger_seconds || 1.2);
+  const highlightStaggerSeconds = Number.isFinite(highlightStaggerRaw) ? Math.max(0.05, Math.min(5, highlightStaggerRaw)) : 1.2;
   const accent = /^#[0-9a-f]{6}$/i.test(String(props.accent || body.accent || "")) ? String(props.accent || body.accent) : "#f0b24c";
   const type = ["news", "quote"].includes(String(props.type || body.type || "")) ? String(props.type || body.type) : undefined;
   const layout = cleanRemotionText(props.layout || body.layout, 24);
@@ -3057,12 +3898,12 @@ function buildRemotionProps(body = {}) {
     ? {
         dim: Number.isFinite(Number(props.background.dim)) ? Math.max(0, Math.min(1, Number(props.background.dim))) : undefined,
         blur: Number.isFinite(Number(props.background.blur)) ? Math.max(0, Math.min(80, Number(props.background.blur))) : undefined,
-        image: remotionMediaAssetRef(props.background.image || props.background.video) || cleanRemotionText(props.background.image || props.background.video, 600) || undefined
+        image: remotionMediaAssetRef(props.background.image || props.background.video) || cleanRemotionAssetInput(props.background.image || props.background.video) || undefined
       }
     : undefined;
-  const avatar = remotionMediaAssetRef(props.avatar || body.avatar) || cleanRemotionText(props.avatar || body.avatar, 600);
+  const avatar = remotionMediaAssetRef(props.avatar || body.avatar) || cleanRemotionAssetInput(props.avatar || body.avatar);
   const logoIcon = remotionMediaAssetRef(props.logoIcon || props.logo_icon || body.logoIcon || body.logo_icon) ||
-    cleanRemotionText(props.logoIcon || props.logo_icon || body.logoIcon || body.logo_icon, 600);
+    cleanRemotionAssetInput(props.logoIcon || props.logo_icon || body.logoIcon || body.logo_icon);
   return {
     variant: cleanRemotionText(props.variant || body.variant, 40) || "editorial",
     ...(type ? { type } : {}),
@@ -3077,7 +3918,10 @@ function buildRemotionProps(body = {}) {
     label,
     accent,
     textScale,
+    lineHeightScale,
     highlightDelaySeconds,
+    highlightDurationSeconds,
+    highlightStaggerSeconds,
     transparent,
     ...(avatar ? { avatar } : {}),
     ...(logoIcon ? { logoIcon } : {}),
@@ -3195,16 +4039,19 @@ async function handleScreenshotLabCapture(reqUrl, res) {
   const saveScrapeId = String(reqUrl.searchParams.get("scrape") || "").trim();
   const saveIndex = reqUrl.searchParams.get("index");
   const shouldSave = Boolean(saveScrapeId && saveIndex);
+  if (browserSessionStatus().running) {
+    text(res, 409, "Browser Session is open. Stop Session before capture so Screenshot Lab can use the saved Docker profile.");
+    return;
+  }
   try {
-    const { stdout } = await execFileAsync(process.execPath, [
-      scriptPath,
-      "--url", url,
-      "--width", String(profile.width),
-      "--height", String(profile.height),
-      "--zoom", String(profile.zoom),
-      "--scroll", String(profile.scroll),
-      "--timeout_ms", "45000"
-    ], { windowsHide: true, timeout: 70000, encoding: "buffer", maxBuffer: 32 * 1024 * 1024 });
+    const { stdout } = await execFileAsync(process.execPath, await screenshotEngineArgs({
+      url,
+      width: profile.width,
+      height: profile.height,
+      zoom: profile.zoom,
+      scroll: profile.scroll,
+      timeoutMs: "45000"
+    }), { windowsHide: true, timeout: 70000, encoding: "buffer", maxBuffer: 32 * 1024 * 1024 });
     if (!Buffer.isBuffer(stdout) || stdout.length < 1024) {
       text(res, 502, "Screenshot engine returned no image");
       return;
@@ -3229,11 +4076,15 @@ async function handleScreenshotLabCapture(reqUrl, res) {
     });
     res.end(stdout);
   } catch (error) {
+    if (String(error?.message || "").includes("anti-bot-page")) {
+      text(res, 409, "Site returned Cloudflare/anti-bot verification instead of the article. Open the link in your normal browser or use a saved browser profile with a valid clearance cookie.");
+      return;
+    }
     text(res, 502, String(error?.message || "screenshot failed"));
   }
 }
 
-async function handleMediaRaw(reqUrl, res) {
+async function handleMediaRaw(req, res, reqUrl) {
   const relPath = String(reqUrl.searchParams.get("path") || "");
   const target = safeResolveMediaPath(relPath);
   if (!target) {
@@ -3241,10 +4092,50 @@ async function handleMediaRaw(reqUrl, res) {
     return;
   }
   try {
-    const body = await fs.readFile(target);
+    const stats = await fs.stat(target);
+    if (!stats.isFile()) {
+      text(res, 404, "Not found");
+      return;
+    }
+
     const contentType = MIME_TYPES.get(path.extname(target).toLowerCase()) || "application/octet-stream";
-    res.writeHead(200, { "content-type": contentType, "cache-control": "no-store" });
-    res.end(body);
+    const range = req.headers.range;
+
+    if (range) {
+      const parts = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(parts[0], 10);
+      const end = parts[1] ? parseInt(parts[1], 10) : stats.size - 1;
+
+      if (start >= stats.size || end >= stats.size || start > end) {
+        res.writeHead(416, {
+          "Content-Range": `bytes */${stats.size}`,
+          "Cache-Control": "no-store"
+        });
+        res.end();
+        return;
+      }
+
+      const chunksize = (end - start) + 1;
+      const fileStream = createReadStream(target, { start, end });
+
+      res.writeHead(206, {
+        "Content-Range": `bytes ${start}-${end}/${stats.size}`,
+        "Accept-Ranges": "bytes",
+        "Content-Length": chunksize,
+        "Content-Type": contentType,
+        "Cache-Control": "no-store"
+      });
+
+      fileStream.pipe(res);
+    } else {
+      res.writeHead(200, {
+        "Content-Length": stats.size,
+        "Content-Type": contentType,
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "no-store"
+      });
+      createReadStream(target).pipe(res);
+    }
   } catch {
     text(res, 404, "Not found");
   }
@@ -3297,8 +4188,12 @@ async function refreshScrapeFromNotionOnce(id) {
     progress.push(String(message ?? ""));
     console.log(`[notion-refresh] ${message}`);
   });
+  if (/just a moment|enable javascript and cookies|verify you are human|attention required! \| cloudflare/i.test(String(notionContent || ""))) {
+    throw new Error("Notion refresh blocked by Cloudflare challenge page");
+  }
   const protectedLinks = preserveEnrichedLinkSegments(notionContent, existing.segments || []);
-  const content = protectedLinks.content;
+  const protectedEditorial = preserveEditorialSegments(protectedLinks.content, existing.segments || []);
+  const content = protectedEditorial.content;
   if (content === existing.content) {
     return {
       scrape: existing,
@@ -3313,13 +4208,15 @@ async function refreshScrapeFromNotionOnce(id) {
         same: Array.isArray(existing.segments) ? existing.segments.length : 0,
         removed: 0,
         debug: [],
-        preserved_links: protectedLinks.preserved
+        preserved_links: protectedLinks.preserved,
+        preserved_editorial: protectedEditorial.preserved
       }
     };
   }
   const snapshot = await snapshotScrape(existing, "refresh");
   const segmentState = assignSegmentIds(content, existing.segments || []);
   segmentState.report.preserved_links = protectedLinks.preserved;
+  segmentState.report.preserved_editorial = protectedEditorial.preserved;
   const updated = {
     ...existing,
     title: titleFromContent(content),
@@ -3533,7 +4430,7 @@ async function handleRequest(req, res) {
       return;
     }
     if (req.method === "GET" && reqUrl.pathname === "/api/media/raw") {
-      await handleMediaRaw(reqUrl, res);
+      await handleMediaRaw(req, res, reqUrl);
       return;
     }
     if (req.method === "GET" && reqUrl.pathname === "/api/media/check-graphics") {
@@ -3551,6 +4448,24 @@ async function handleRequest(req, res) {
     if (req.method === "GET" && reqUrl.pathname === "/api/screenshot-lab/capture") {
       await handleScreenshotLabCapture(reqUrl, res);
       return;
+    }
+    if (req.method === "GET" && reqUrl.pathname.startsWith("/devtools/")) {
+      await proxyDevToolsHttp(reqUrl, res);
+      return;
+    }
+    if (reqUrl.pathname === "/api/browser-session") {
+      if (req.method === "GET") {
+        json(res, 200, browserSessionStatus());
+        return;
+      }
+      if (req.method === "POST") {
+        await startScreenshotBrowserSession(res, reqUrl.searchParams.get("url") || "");
+        return;
+      }
+      if (req.method === "DELETE") {
+        await stopScreenshotBrowserSession(res);
+        return;
+      }
     }
     if (req.method === "POST" && reqUrl.pathname === "/api/media/upload") {
       await handleMediaUpload(req, res);
@@ -3618,8 +4533,51 @@ server.on("error", (error) => {
   throw error;
 });
 
-server.listen(PORT, () => {
+server.on("upgrade", (req, socket, head) => {
+  try {
+    const reqUrl = new URL(req.url || "/", `http://${req.headers.host || `localhost:${PORT}`}`);
+    if (!reqUrl.pathname.startsWith("/devtoolsws/")) {
+      socket.destroy();
+      return;
+    }
+    if (!browserSessionStatus().running) {
+      socket.end("HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\nBrowser session is not running");
+      return;
+    }
+    const upstreamPath = reqUrl.pathname.replace(/^\/devtoolsws(?=\/|$)/, "") || "/";
+    const upstream = netConnect(SCREENSHOT_REMOTE_DEBUGGING_PORT, "127.0.0.1", () => {
+      const headers = [`GET ${upstreamPath}${reqUrl.search || ""} HTTP/1.1`];
+      const rawHeaders = req.rawHeaders || [];
+      const seen = new Set();
+      for (let index = 0; index < rawHeaders.length; index += 2) {
+        const name = String(rawHeaders[index] || "");
+        const value = String(rawHeaders[index + 1] || "");
+        const key = name.toLowerCase();
+        if (!name || key === "host" || key === "origin" || seen.has(key)) continue;
+        seen.add(key);
+        headers.push(`${name}: ${value}`);
+      }
+      headers.push(
+        `Host: 127.0.0.1:${SCREENSHOT_REMOTE_DEBUGGING_PORT}`,
+        "Origin: http://localhost",
+        "\r\n"
+      );
+      upstream.write(headers.join("\r\n"));
+      if (head?.length) upstream.write(head);
+      upstream.pipe(socket);
+      socket.pipe(upstream);
+    });
+    upstream.on("error", () => socket.destroy());
+    socket.on("error", () => upstream.destroy());
+  } catch {
+    socket.destroy();
+  }
+});
+
+server.listen(PORT, async () => {
   console.log(`UContent: http://localhost:${PORT}/script-text`);
+  await ensureMediaSymlink();
+  await syncDefaultLogos();
   startQuickTunnel();
   startTelegramBot({
     PORT,
@@ -3636,6 +4594,7 @@ server.listen(PORT, () => {
     getMediaMetadata: MEDIA_INDEX.get,
     upsertMediaMetadata: MEDIA_INDEX.upsert,
     moveMediaMetadata: MEDIA_INDEX.move,
+    removeMediaMetadata: MEDIA_INDEX.remove,
     listMediaMetadata: MEDIA_INDEX.entries,
     renderRemotionCard,
     resolveDownloaderTools,

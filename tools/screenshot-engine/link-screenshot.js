@@ -1,3 +1,5 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import { loadCookiesFromPath, normalizeCookiesForPuppeteer } from "./cookie-utils.js";
 
 let puppeteerModule = null;
@@ -40,6 +42,7 @@ if (!isHttpUrl(rawUrl)) {
 
 const debugAdblock = String(process.env.SCREENSHOT_DEBUG_ADBLOCK ?? "").trim() === "1";
 const cookiesPath = String(args.cookies_path ?? "").trim();
+const userDataDir = String(args.user_data_dir ?? "").trim();
 const outputWidth = Math.round(toNumber(args.width, 2560, 320, 3840));
 const outputHeight = Math.round(toNumber(args.height, 1280, 240, 2160));
 const zoomPercent = toNumber(args.zoom, 200, 50, 800);
@@ -60,6 +63,12 @@ const viewportWidth = Math.max(320, Math.round(outputWidth / zoomFactor));
 const viewportHeight = Math.max(240, Math.round(outputHeight / zoomFactor));
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function removeStaleChromeProfileLocks(profileDir) {
+  if (!profileDir) return;
+  const names = ["SingletonLock", "SingletonSocket", "SingletonCookie"];
+  await Promise.all(names.map((name) => fs.rm(path.join(profileDir, name), { force: true, recursive: true }).catch(() => null)));
+}
 
 async function hideScrollbarsForCapture(page) {
   try {
@@ -447,8 +456,10 @@ async function assessPageState(page) {
 
 let browser;
 try {
+  await removeStaleChromeProfileLocks(userDataDir);
   browser = await puppeteer.launch({
     headless: true,
+    ...(userDataDir ? { userDataDir } : {}),
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
@@ -522,8 +533,7 @@ try {
     throw new Error("anti-bot-page");
   }
 
-  let headingTop = await findHeadingTop(page);
-  if (!Number.isFinite(headingTop) && Number(pageState?.textLen ?? 0) < 120) {
+  if (Number(pageState?.textLen ?? 0) < 120) {
     // Some pages render late; one additional settle pass avoids blank/spinner screenshots.
     await sleep(1500);
     await dismissOverlays(page);
@@ -532,23 +542,12 @@ try {
     if (pageState?.isAntiBot) {
       throw new Error("anti-bot-page");
     }
-    headingTop = await findHeadingTop(page);
-    if (!Number.isFinite(headingTop) && Number(pageState?.textLen ?? 0) < 120) {
+    if (Number(pageState?.textLen ?? 0) < 120) {
       throw new Error("empty-or-loading-page");
     }
   }
 
-  if (Number.isFinite(headingTop)) {
-    let targetTop = Math.max(0, Math.round(headingTop - 185));
-    if (isRbcHost) {
-      // For RBC the top bar is critical in frame. Any downward scroll can hide it.
-      targetTop = 0;
-    }
-    targetTop = Math.max(0, targetTop + scrollOffset);
-    await page.evaluate((offset) => window.scrollTo(0, offset), targetTop);
-  } else {
-    await page.evaluate((offset) => window.scrollTo(0, offset), scrollOffset);
-  }
+  await page.evaluate((offset) => window.scrollTo(0, offset), scrollOffset);
 
   await sleep(700);
   await dismissOverlays(page);

@@ -35,6 +35,8 @@ UContent - это редакционный центр управления вы�
 
 - Media download pipeline:
   - единая модель результата для `yt-dlp`, `gallery-dl`, direct download и fallback;
+  - `UContent Doctor`: диагностика YouTube, Instagram, X/Twitter, Screenshot Lab, cookies, Deno, IPv4, Telegram Bot API и доступности browser profile;
+  - registry стратегий загрузки по платформам: явно показывать primary/fallback backend, причину выбора, причину отказа и следующий ручной шаг;
   - сравнение качества дубликатов для X/Twitter, TikTok, Instagram и других соцсетей;
   - сохранение metadata sidecar и нормализация `title`, `description`, `uploader`, `webpage_url`;
   - понятные ошибки: блокировка, DNS, cookies, file too large, extractor broken, no media;
@@ -323,4 +325,3 @@ UContent - это редакционный центр управления вы�
 - Обновляет `media-index.json`, если меняет медиа.
 - Имеет хотя бы один smoke test или проверяемый ручной сценарий.
 - Документирует новый workflow в README или отдельном документе.
-

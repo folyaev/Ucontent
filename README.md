@@ -92,6 +92,52 @@ UContent prefers local tools:
 
 External paths can still be set through `.env`, but they are no longer required for the default layout.
 
+## Restricted YouTube Downloads
+
+If YouTube shows a login/age screen instead of downloading media, pass cookies to `yt-dlp`.
+
+For Docker, export Firefox/Chrome cookies as Netscape `cookies.txt`, place it at `data/cookies.txt`, and set:
+
+```env
+MEDIA_COOKIES_PATH=/app/data/cookies.txt
+```
+
+For a native host run, `yt-dlp` can also read a browser profile directly:
+
+```env
+MEDIA_COOKIES_FROM_BROWSER=Firefox
+```
+
+Optional YouTube JS challenge runtime:
+
+```env
+MEDIA_YTDLP_JS_RUNTIME=node
+# or, on Windows native runs:
+MEDIA_YTDLP_JS_RUNTIME=deno:C:/path/to/deno.exe
+```
+
+## Docker Browser Session
+
+Screenshot Lab uses a Docker Chrome profile at:
+
+```text
+data/browser-profile
+```
+
+Open Screenshot Lab and click `Session` to start Docker Chrome with a visible noVNC browser session. The browser UI is available at:
+
+```text
+http://localhost:6080/vnc.html?autoconnect=true&resize=scale&path=websockify
+```
+
+Log in to sites there or pass interactive checks, then click `Stop Session`. Future Screenshot Lab captures use the same saved profile, including cookies and localStorage. DevTools remote debugging remains available internally on port `9222`.
+
+Media downloads also use this Docker Chrome profile automatically when neither `MEDIA_COOKIES_PATH` nor `MEDIA_COOKIES_FROM_BROWSER` is set. For example, after logging in to YouTube inside `Session`, `yt-dlp` receives:
+
+```text
+--cookies-from-browser chrome:/app/data/browser-profile
+```
+
 ## Remotion Graphics
 
 The media picker can render Remotion quote/news cards directly into `media/graphics` and attach the result to the active segment.
