@@ -972,10 +972,23 @@ function notionSegmentIds(scrape) {
   return (scrape?.segments || []).map((segment) => String(segment?.id || "").trim()).filter(Boolean);
 }
 
+function triggerTtsBackgroundForScrape(scrape) {
+  if (typeof botContext?.generateTtsForScrape === "function" && scrape) {
+    botContext.generateTtsForScrape(scrape).then((stats) => {
+      if (stats?.generated > 0) {
+        console.log(`[tts] auto-generated: ${stats.generated} new, ${stats.skipped} cached, ${stats.errors} errors`);
+      }
+    }).catch((error) => {
+      console.error(`[tts] background generation error: ${error.message}`);
+    });
+  }
+}
+
 function setNotionBaseline(session, scrape) {
   session.notionBaselineScrapeId = String(scrape?.id || "");
   session.notionKnownSegmentIds = notionSegmentIds(scrape);
   session.notionKnownTopics = notionTopics(scrape);
+  triggerTtsBackgroundForScrape(scrape);
 }
 
 function formatNotionAdditions(scrape, addedSegments, addedTopics) {
@@ -1031,6 +1044,16 @@ async function refreshActiveSdvgNotion(token) {
     }
     setNotionBaseline(currentSession, scrape);
     await saveSession(botContext.DATA_DIR, currentSession);
+    // Fire TTS generation in background — no await, never blocks the refresh cycle
+    if (typeof botContext.generateTtsForScrape === "function") {
+      botContext.generateTtsForScrape(scrape).then((stats) => {
+        if (stats.generated > 0) {
+          console.log(`[tts] auto-generated: ${stats.generated} new, ${stats.skipped} cached, ${stats.errors} errors`);
+        }
+      }).catch((error) => {
+        console.error(`[tts] background generation error: ${error.message}`);
+      });
+    }
   } catch (error) {
     console.error(`[notion-auto-refresh] ${scrapeId}: ${error.message}`);
   } finally {

@@ -42,7 +42,7 @@ export function createXmlExportUtils(deps) {
   };
   const XML_PPRO_TICKS_PER_FRAME = 5080320000;
   const XML_RESERVED_VIDEO_TRACKS = 2;
-  const XML_RESERVED_AUDIO_TRACKS = 1;
+  const XML_RESERVED_AUDIO_TRACKS = 0;
   const XML_TIMELINE_ALIGNMENT_ENABLED = String(process.env.XML_TIMELINE_ALIGNMENT_ENABLED ?? "").trim() === "1";
   const XML_AUTO_BACKGROUNDS_ENABLED = String(process.env.XML_AUTO_BACKGROUNDS_ENABLED ?? "1").trim() !== "0";
   const XML_ALLOW_CROSS_TOPIC_MEDIA = String(process.env.XML_ALLOW_CROSS_TOPIC_MEDIA ?? "").trim() === "1";
@@ -73,6 +73,7 @@ export function createXmlExportUtils(deps) {
       [854, 480, 225, XML_DEFAULT_CENTER.x, XML_DEFAULT_CENTER.y],
       [1024, 1024, 94, null, null],
       [1280, 720, 150, XML_DEFAULT_CENTER.x, XML_DEFAULT_CENTER.y],
+      [1200, 630, 137.0, XML_DEFAULT_CENTER.x, XML_DEFAULT_CENTER.y],
       [1080, 1080, 88.9, null, null],
       [720, 1280, 75, XML_DEFAULT_CENTER.x, XML_DEFAULT_CENTER.y],
       [1080, 1920, 50, XML_DEFAULT_CENTER.x, XML_DEFAULT_CENTER.y],
@@ -677,16 +678,21 @@ function getXmlSegmentMarkerName(segment) {
 }
 
 function resolveXmlSegmentMarkerColor({ segment, visual }) {
-  if (Boolean(segment?.is_done)) {
-    return XML_DONE_MARKER_COLOR;
+  const textQuote = String(segment?.text_quote || segment?.text || "").trim();
+  const isLink = String(segment?.block_type || segment?.type || segment?.kind || "").toLowerCase() === "link" || /^https?:\/\/\S+/i.test(textQuote);
+  const isDirectiveOrSearchHint = textQuote.startsWith("/");
+
+  if (isLink || isDirectiveOrSearchHint) {
+    return XML_SECTION_MARKER_COLOR; // Blue marker for links and search directives/hints
   }
 
   const priority = String(visual?.priority ?? "").trim().toLowerCase();
-  if (!priority) return XML_SECTION_MARKER_COLOR;
   if (/(обяз|нужн|required|high)/i.test(priority)) return XML_REQUIRED_MARKER_COLOR;
   if (/(рекоменд|recommend|medium)/i.test(priority)) return XML_RECOMMENDED_MARKER_COLOR;
   if (/(при\s*налич|если\s*есть|optional|low)/i.test(priority)) return XML_OPTIONAL_MARKER_COLOR;
-  return XML_SECTION_MARKER_COLOR;
+
+  // Plain text segments get White marker
+  return XML_DONE_MARKER_COLOR;
 }
 
 function buildContentDisposition(fileName) {
@@ -724,7 +730,10 @@ function toXmlFileUrl(pathLike) {
   if (!raw) return "";
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw)) return raw;
   if (/^[a-zA-Z]:[\\/]/.test(raw) || /^\\\\/.test(raw)) {
-    return pathToFileURL(path.win32.normalize(raw)).href;
+    const normalized = raw.replace(/\\/g, "/");
+    const parts = normalized.split("/");
+    const encoded = parts.map((part, index) => (index === 0 ? part : encodeURIComponent(part))).join("/");
+    return `file://localhost/${encoded}`;
   }
   if (raw.startsWith("/")) {
     const normalized = raw.replace(/\\/g, "/");
@@ -1065,8 +1074,9 @@ function renderXmlAudioClipItem({ clip, fps, videoPeer, audioPeers = [] }) {
   const pproTicksIn = framesToXmlPproTicks(sourceInFrame);
   const pproTicksOut = framesToXmlPproTicks(sourceOutFrame);
   const clipItemDurationFrames = resolveXmlClipItemDurationFrames(clip);
+  const channelType = clip?.audioChannelCount === 1 ? "mono" : "stereo";
   const lines = [
-    `          <clipitem id="${escapeXml(clip.clipId)}" premiereChannelType="stereo">`,
+    `          <clipitem id="${escapeXml(clip.clipId)}" premiereChannelType="${channelType}">`,
     `            <masterclipid>${escapeXml(clip.entry.masterClipId)}</masterclipid>`,
     `            <name>${escapeXml(clip.fileName)}</name>`,
     "            <enabled>TRUE</enabled>",
@@ -1483,7 +1493,16 @@ async function buildXmlExportPayload({
     });
 
     const resolvedMediaFiles = [];
-    for (const { mediaPath, sourceStartRaw } of mediaCandidates) {
+    for (let { mediaPath, sourceStartRaw } of mediaCandidates) {
+      if (/\.(avif|webp|webm|mkv)$/i.test(mediaPath)) {
+        const ext = path.extname(mediaPath).toLowerCase();
+        const targetExt = (ext === ".avif" || ext === ".webp") ? ".jpg" : ".mp4";
+        const convertedPath = mediaPath.slice(0, -ext.length) + targetExt;
+        const convertedAbs = safeResolveMediaPath(mediaRoot, convertedPath);
+        if (convertedAbs && (await fs.stat(convertedAbs).catch(() => null))?.isFile()) {
+          mediaPath = convertedPath;
+        }
+      }
       if (!isXmlMediaPathCompatibleWithSegment(mediaPath, segment)) continue;
       const absolutePath = safeResolveMediaPath(mediaRoot, mediaPath);
       if (!absolutePath) continue;
@@ -1492,7 +1511,25 @@ async function buildXmlExportPayload({
       resolvedMediaFiles.push({ mediaPath, absolutePath, sourceStartRaw });
     }
 
-    if (!resolvedMediaFiles.length) {
+    // Resolve TTS audio if available
+    const ttsAudioCandidate = normalizeMediaFilePath(visual.tts_audio_path ?? null);
+    let resolvedTtsAudio = null;
+    if (ttsAudioCandidate) {
+      const ttsAbsPath = safeResolveMediaPath(mediaRoot, ttsAudioCandidate);
+      if (ttsAbsPath) {
+        const ttsStats = await fs.stat(ttsAbsPath).catch(() => null);
+        if (ttsStats?.isFile() && ttsStats.size > 0) {
+          const ttsInfo = await getXmlMediaInfo(ttsAbsPath, "audio");
+          resolvedTtsAudio = {
+            mediaPath: ttsAudioCandidate,
+            absolutePath: ttsAbsPath,
+            durationSec: ttsInfo?.durationSec ?? visual.duration_hint_sec
+          };
+        }
+      }
+    }
+
+    if (!resolvedMediaFiles.length && !resolvedTtsAudio) {
       const segmentStartFrame = alignmentItem?.start_frame ?? frameCursor;
       const segmentDurationSec = normalizeXmlDurationSeconds(visual.duration_hint_sec, fallbackDuration, "video");
       const segmentDurationFrames = alignmentItem
@@ -1511,7 +1548,7 @@ async function buildXmlExportPayload({
     let segmentAudioTrackCursor = 0;
     let segmentAudioFilesCount = 0;
 
-    const primaryCategory = detectXmlMediaCategory(resolvedMediaFiles[0].absolutePath);
+    const primaryCategory = resolvedMediaFiles.length ? detectXmlMediaCategory(resolvedMediaFiles[0].absolutePath) : "video";
     let rangeDurationSec = null;
     const firstMedia = resolvedMediaFiles[0];
     if (firstMedia && firstMedia.sourceStartRaw && firstMedia.sourceStartRaw.includes("-")) {
@@ -1524,9 +1561,12 @@ async function buildXmlExportPayload({
         }
       }
     }
-    const desiredDurationSec = rangeDurationSec !== null
-      ? rangeDurationSec
-      : normalizeXmlDurationSeconds(visual.duration_hint_sec, fallbackDuration, primaryCategory);
+    const ttsDuration = Number(resolvedTtsAudio?.durationSec || visual.duration_hint_sec);
+    const desiredDurationSec = Number.isFinite(ttsDuration) && ttsDuration > 0
+      ? ttsDuration
+      : (rangeDurationSec !== null
+          ? rangeDurationSec
+          : normalizeXmlDurationSeconds(visual.duration_hint_sec, fallbackDuration, primaryCategory));
     const desiredDurationFrames = alignmentItem
       ? Math.max(1, alignmentItem.end_frame - alignmentItem.start_frame)
       : secondsToFrames(desiredDurationSec, fpsValue);
@@ -1631,7 +1671,9 @@ async function buildXmlExportPayload({
       if (isXmlSequenceAspectByDimensions(entry.sourceDimensions)) return false;
       return true;
     });
-    if (backgroundCandidateEntries.length > 0 && backgroundAssets.size > 0) {
+
+    const needsAutoBackground = backgroundCandidateEntries.length > 0;
+    if (needsAutoBackground && backgroundAssets.size > 0) {
       const hasPortraitEntry = backgroundCandidateEntries.some((entry) => isXmlPortraitDimensions(entry.sourceDimensions));
       const hasImageEntry = backgroundCandidateEntries.some((entry) => String(entry?.category ?? "") === "image");
       const titleQuoteMode = isXmlTitleQuoteFormatHint(visual?.format_hint);
@@ -1699,6 +1741,43 @@ async function buildXmlExportPayload({
           segmentEntries.unshift(...backgroundEntries);
         }
       }
+    }
+
+    // Attach TTS audio clip on Track A1 if present
+    if (resolvedTtsAudio) {
+      const ttsMediaIndex = mediaEntries.length + segmentEntries.length + 1;
+      const ttsXmlPath = resolveXmlPathWithMediaRootOverride({
+        mediaPath: resolvedTtsAudio.mediaPath,
+        absolutePath: resolvedTtsAudio.absolutePath,
+        mediaPathRootOverride
+      });
+      const ttsTotalFrames = secondsToFramesAllowZero(resolvedTtsAudio.durationSec, fpsValue);
+      segmentEntries.push({
+        entryId: `entry-tts-${ttsMediaIndex}`,
+        segmentId: segmentId || `segment_${index + 1}`,
+        segmentQuote: String(segment?.text_quote ?? ""),
+        segmentBlockType: String(segment?.block_type ?? ""),
+        visualFormatHint: String(visual?.format_hint ?? ""),
+        fileId: `file-tts-${ttsMediaIndex}`,
+        masterClipId: `masterclip-tts-${ttsMediaIndex}`,
+        fileName: path.basename(resolvedTtsAudio.absolutePath),
+        pathUrl: toXmlFileUrl(ttsXmlPath),
+        durationFrames: desiredDurationFrames,
+        sourceTotalFrames: ttsTotalFrames > 0 ? ttsTotalFrames : desiredDurationFrames,
+        sourceInFrame: 0,
+        sourceOutFrame: desiredDurationFrames,
+        startFrame: segmentStartFrame,
+        endFrame: segmentEndFrame,
+        category: "audio",
+        hasAudio: true,
+        hasVideo: false,
+        audioChannelCount: 1,
+        sourceDimensions: null,
+        videoTrackIndex: null,
+        audioTrackHint: 1,
+        motion: null
+      });
+      segmentAudioFilesCount = Math.max(segmentAudioFilesCount, 1);
     }
 
     maxAudioFilesPerSegment = Math.max(maxAudioFilesPerSegment, segmentAudioFilesCount || 1);
@@ -1795,7 +1874,7 @@ async function buildXmlExportPayload({
   });
 
   return {
-    clipCount: contentClipCount,
+    clipCount: mediaEntries.length,
     fileName: exportFileName,
     xml
   };

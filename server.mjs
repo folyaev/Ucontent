@@ -132,6 +132,7 @@ const DOWNLOAD_COMMAND_MAX_TIMEOUT_MS = Number(process.env.DOWNLOAD_COMMAND_MAX_
 const MEDIA_DISCOVERY_MAX_HTML_BYTES = 2 * 1024 * 1024;
 const MEDIA_DISCOVERY_MAX_CANDIDATES = 20;
 const REMOTION_RENDER_TIMEOUT_MS = Number(process.env.REMOTION_RENDER_TIMEOUT_MS || 10 * 60_000);
+const VOICE_TTS_URL = (process.env.VOICE_TTS_URL || "http://127.0.0.1:8765").replace(/\/$/, "");
 const execFileAsync = promisify(execFile);
 const WEBAPP_TOKEN_PATH = path.join(DATA_DIR, "webapp-access-token");
 const MEDIA_INDEX = createMediaIndex({ filePath: path.join(__dirname, "data", "media-index.json") });
@@ -3039,7 +3040,10 @@ function cloneSegmentState(source) {
     media_items: mediaItems,
     media_layout: normalizeMediaLayout(source?.media_layout),
     is_done: Boolean(source?.is_done),
-    suppressed_link_previews: normalizeSuppressedLinkPreviews(source?.suppressed_link_previews)
+    suppressed_link_previews: normalizeSuppressedLinkPreviews(source?.suppressed_link_previews),
+    tts_audio: source?.tts_audio && typeof source.tts_audio === "object"
+      ? { ...source.tts_audio }
+      : null
   };
 }
 
@@ -3511,7 +3515,216 @@ function buildXmlForScrape(scrape) {
   ].filter(Boolean).join("\n");
 }
 
+function ttsTextHash(text) {
+  return createHash("sha256").update(String(text || "").trim()).digest("hex").slice(0, 16);
+}
+
+async function generateTtsForSegment(segment, pampamRoot) {
+  const text = String(segment?.text || "").trim();
+  if (!text) return null;
+  const segmentId = String(segment?.id || "").trim();
+  if (!segmentId) return null;
+
+  const topic = String(segment?.topic || "Без темы").trim() || "Без темы";
+  const { safeTopic, dir: topicDir } = await ensureTopicDir(topic);
+  const audioDir = path.join(topicDir, "audio");
+  await fs.mkdir(audioDir, { recursive: true });
+
+  const textHash = ttsTextHash(text);
+  const existing = segment.tts_audio;
+  if (existing?.path && existing?.text_hash === textHash && existing?.duration_sec > 0) {
+    const absPath = safeResolveMediaPathForRoot(pampamRoot, existing.path);
+    if (absPath) {
+      const stats = await fs.stat(absPath).catch(() => null);
+      if (stats?.isFile() && stats.size > 0) {
+        return existing;
+      }
+    }
+  }
+
+  const match = segmentId.match(/_(\d+)$/);
+  const indexNum = match ? parseInt(match[1], 10) : 0;
+  const numStr = indexNum > 0 ? (indexNum < 10 ? `0${indexNum}` : String(indexNum)) : "";
+  const numPrefix = numStr ? `${numStr}_` : "";
+
+  const wavFileName = `${numPrefix}voice_${segmentId}.wav`;
+  const wavAbsPath = path.join(audioDir, wavFileName);
+  const wavRelPath = path.posix.join(safeTopic, "audio", wavFileName);
+
+  // Recover numbered, unnumbered, or legacy WAVs only when there is no evidence
+  // that the file belongs to an older version of this segment's text.
+  const canReuseDiskCandidate = !existing?.text_hash || existing.text_hash === textHash;
+  if (canReuseDiskCandidate) {
+    const candidateAbsPaths = [wavAbsPath, path.join(audioDir, `voice_${segmentId}.wav`), path.join(pampamRoot, "_tts", `tts_${segmentId}.wav`)];
+    for (const candPath of candidateAbsPaths) {
+      const candStats = await fs.stat(candPath).catch(() => null);
+      if (candStats?.isFile() && candStats.size > 0) {
+        if (candPath !== wavAbsPath) {
+          await fs.rename(candPath, wavAbsPath).catch(() => null);
+        }
+        const ffprobe = await resolveFfprobePath();
+        let durationSec = null;
+        try {
+          const { stdout } = await execFileAsync(ffprobe, [
+            "-v", "error", "-show_entries", "format=duration", "-of", "json", wavAbsPath
+          ], { windowsHide: true, timeout: 15_000 });
+          const parsed = JSON.parse(String(stdout || "{}"));
+          const raw = Number(parsed?.format?.duration);
+          if (Number.isFinite(raw) && raw > 0) durationSec = raw;
+        } catch { /* ignore */ }
+        if (durationSec) {
+          return { path: wavRelPath, duration_sec: durationSec, text_hash: textHash, generated_at: new Date().toISOString() };
+        }
+      }
+    }
+  }
+
+  console.log(`[tts] generating segment ${segmentId} (${wavFileName}) in ${safeTopic}/audio: ${text.slice(0, 80)}...`);
+
+  let ttsResponse;
+  try {
+    ttsResponse = await fetch(`${VOICE_TTS_URL}/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "connection": "close" },
+      body: JSON.stringify({ text }),
+      signal: AbortSignal.timeout(120_000)
+    });
+  } catch (error) {
+    throw new Error(`TTS server unreachable: ${error.message}`);
+  }
+  if (!ttsResponse.ok) {
+    let errText = "";
+    try { errText = await ttsResponse.text(); } catch { /* ignore */ }
+    throw new Error(`TTS server error ${ttsResponse.status}: ${errText.slice(0, 200)}`);
+  }
+
+  const wavBuffer = Buffer.from(await ttsResponse.arrayBuffer());
+  if (!wavBuffer.length || wavBuffer.length < 44) {
+    throw new Error(`TTS returned empty/invalid WAV for segment ${segmentId}`);
+  }
+
+  const stagingPath = wavAbsPath + ".tmp";
+  await fs.writeFile(stagingPath, wavBuffer);
+
+  // Trim leading silence from F5-TTS audio and add tiny 40ms pad
+  const tools = await resolveDownloaderTools();
+  const ffmpeg = tools.ffmpeg_path || "ffmpeg";
+  const trimmedStaging = wavAbsPath + ".trimmed.wav";
+  try {
+    await execFileAsync(ffmpeg, [
+      "-y",
+      "-i", stagingPath,
+      "-af", "silenceremove=start_periods=1:start_duration=0.01:start_threshold=-40dB,adelay=40|40",
+      trimmedStaging
+    ], { windowsHide: true, timeout: 15_000 });
+    const trimmedStats = await fs.stat(trimmedStaging).catch(() => null);
+    if (trimmedStats?.isFile() && trimmedStats.size > 0) {
+      await fs.unlink(stagingPath).catch(() => null);
+      await fs.rename(trimmedStaging, stagingPath);
+    }
+  } catch (error) {
+    await fs.unlink(trimmedStaging).catch(() => null);
+    console.warn(`[tts] silence trimming failed, keeping original: ${error.message}`);
+  }
+
+  const ffprobe = await resolveFfprobePath();
+  let durationSec = null;
+  try {
+    const { stdout } = await execFileAsync(ffprobe, [
+      "-v", "error",
+      "-show_entries", "format=duration",
+      "-of", "json",
+      stagingPath
+    ], { windowsHide: true, timeout: 15_000, maxBuffer: 512 * 1024 });
+    const parsed = JSON.parse(String(stdout || "{}"));
+    const raw = Number(parsed?.format?.duration);
+    if (Number.isFinite(raw) && raw > 0) durationSec = raw;
+  } catch (error) {
+    await fs.unlink(stagingPath).catch(() => null);
+    throw new Error(`TTS WAV ffprobe validation failed for ${segmentId}: ${error.message}`);
+  }
+  if (!durationSec) {
+    await fs.unlink(stagingPath).catch(() => null);
+    throw new Error(`TTS WAV has zero duration for ${segmentId}`);
+  }
+
+  const previousWavPath = `${wavAbsPath}.previous`;
+  const previousWavStats = await fs.stat(wavAbsPath).catch(() => null);
+  if (previousWavStats?.isFile()) {
+    await fs.unlink(previousWavPath).catch(() => null);
+    await fs.rename(wavAbsPath, previousWavPath);
+  }
+  try {
+    await fs.rename(stagingPath, wavAbsPath);
+  } catch (error) {
+    if (previousWavStats?.isFile()) {
+      await fs.rename(previousWavPath, wavAbsPath).catch(() => null);
+    }
+    throw error;
+  }
+  await fs.unlink(previousWavPath).catch(() => null);
+  console.log(`[tts] segment ${segmentId}: ${durationSec.toFixed(2)}s -> ${wavRelPath}`);
+
+  return { path: wavRelPath, duration_sec: durationSec, text_hash: textHash, generated_at: new Date().toISOString() };
+}
+
+async function generateTtsForScrapeSegments(scrape, writeScrapeFunc) {
+  const segments = Array.isArray(scrape?.segments) ? scrape.segments : [];
+  const textSegments = segments.filter((segment) => {
+    const kind = String(segment?.type || segment?.kind || "").toLowerCase();
+    return kind === "text" || kind === "";
+  }).filter((segment) => String(segment?.text || "").trim().length > 0);
+
+  if (!textSegments.length) return { generated: 0, skipped: 0, errors: 0 };
+
+  let generated = 0;
+  let skipped = 0;
+  let errors = 0;
+  let dirty = false;
+
+  for (const segment of textSegments) {
+    const text = String(segment.text || "").trim();
+    const textHash = ttsTextHash(text);
+    if (segment.tts_audio?.text_hash === textHash && segment.tts_audio?.duration_sec > 0) {
+      const absPath = path.join(PAMPAM_ROOT, segment.tts_audio.path);
+      const stats = await fs.stat(absPath).catch(() => null);
+      if (stats?.isFile() && stats.size > 0) {
+        skipped++;
+        continue;
+      }
+    }
+    try {
+      const ttsAudio = await generateTtsForSegment(segment, PAMPAM_ROOT);
+      if (ttsAudio) {
+        segment.tts_audio = ttsAudio;
+        segment.updated_at = new Date().toISOString();
+        dirty = true;
+        generated++;
+      }
+    } catch (error) {
+      console.error(`[tts] segment ${segment.id}: ${error.message}`);
+      errors++;
+    }
+  }
+
+  if (dirty && writeScrapeFunc) {
+    try {
+      scrape.updated_at = new Date().toISOString();
+      await writeScrapeFunc(scrape, { writeMarkdown: false });
+    } catch (error) {
+      console.error(`[tts] failed to save scrape after TTS: ${error.message}`);
+    }
+  }
+
+  return { generated, skipped, errors };
+}
+
 async function buildVbautXmlForScrape(scrape) {
+  try {
+    await generateTtsForScrapeSegments(scrape, writeScrape);
+  } catch (err) {
+    console.warn(`[xml-export] generateTtsForScrapeSegments error: ${err.message}`);
+  }
   const segments = Array.isArray(scrape?.segments) && scrape.segments.length
     ? scrape.segments
     : assignSegmentIds(scrape?.content ?? "").segments;
@@ -3523,8 +3736,32 @@ async function buildVbautXmlForScrape(scrape) {
     const mediaPaths = [];
     const mediaTimecodes = [];
     for (const item of mediaItems) {
-      const mediaPath = normalizeMediaFilePath(item.path);
+      let mediaPath = normalizeMediaFilePath(item.path);
       if (!mediaPath) continue;
+      if (/\.(avif|webp|webm|mkv)$/i.test(mediaPath)) {
+        const ext = path.extname(mediaPath).toLowerCase();
+        const targetExt = (ext === ".avif" || ext === ".webp") ? ".jpg" : ".mp4";
+        const convertedRel = mediaPath.slice(0, -ext.length) + targetExt;
+        const origAbs = safeResolveMediaPathForRoot(PAMPAM_ROOT, mediaPath);
+        const convertedAbs = safeResolveMediaPathForRoot(PAMPAM_ROOT, convertedRel);
+        if (origAbs) {
+          const origStats = await fs.stat(origAbs).catch(() => null);
+          if (origStats?.isFile() && origStats.size > 0) {
+            if (!(await fs.stat(convertedAbs).catch(() => null))?.size) {
+              const tools = await resolveDownloaderTools();
+              const ffmpeg = tools.ffmpeg_path || "ffmpeg";
+              if (ext === ".avif" || ext === ".webp") {
+                await execFileAsync(ffmpeg, ["-y", "-i", origAbs, "-q:v", "2", convertedAbs]).catch(() => null);
+              } else {
+                await execFileAsync(ffmpeg, ["-y", "-i", origAbs, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", convertedAbs]).catch(() => null);
+              }
+            }
+            if ((await fs.stat(convertedAbs).catch(() => null))?.size > 0) {
+              mediaPath = convertedRel;
+            }
+          }
+        }
+      }
       const absolutePath = safeResolveMediaPathForRoot(PAMPAM_ROOT, mediaPath);
       if (!absolutePath) continue;
       const stats = await fs.stat(absolutePath).catch(() => null);
@@ -3534,11 +3771,32 @@ async function buildVbautXmlForScrape(scrape) {
     }
     const segmentId = String(segment.id || "").trim();
     if (!segmentId) continue;
+    // Resolve TTS audio: validate the file still exists before using it
+    let ttsAudioPath = "";
+    let ttsAudioDurationSec = null;
+    const textQuote = String(segment.text || "").trim();
+    const isSlashDirective = textQuote.startsWith("/");
+    const isLinkUrl = /^https?:\/\/\S+$/i.test(textQuote);
+    const isNonAudioSegment = isSlashDirective || isLinkUrl;
+
+    const ttsAudio = segment.tts_audio;
+    const hasCurrentTtsText = ttsAudio?.text_hash === ttsTextHash(textQuote);
+    if (!isNonAudioSegment && hasCurrentTtsText && ttsAudio?.path && ttsAudio?.duration_sec > 0) {
+      const ttsAbsPath = safeResolveMediaPathForRoot(PAMPAM_ROOT, ttsAudio.path);
+      if (ttsAbsPath) {
+        const ttsStats = await fs.stat(ttsAbsPath).catch(() => null);
+        if (ttsStats?.isFile() && ttsStats.size > 0) {
+          ttsAudioPath = ttsAudio.path;
+          ttsAudioDurationSec = ttsAudio.duration_sec;
+        }
+      }
+    }
+
     vbautSegments.push({
       segment_id: segmentId,
       section_id: stableSectionId(segment.topic || "document"),
       section_title: String(segment.topic || titleFromContent(scrape?.content ?? "") || "Document").trim(),
-      text_quote: String(segment.text || "").trim(),
+      text_quote: textQuote,
       block_type: "segment",
       is_done: Boolean(segment.is_done)
     });
@@ -3548,7 +3806,8 @@ async function buildVbautXmlForScrape(scrape) {
         media_file_paths: mediaPaths,
         media_layout: normalizeMediaLayout(segment.media_layout),
         media_file_timecodes_list: mediaTimecodes,
-        duration_hint_sec: null,
+        duration_hint_sec: ttsAudioDurationSec,
+        tts_audio_path: ttsAudioPath,
         format_hint: "",
         media_file_timecodes: Object.fromEntries(
           mediaPaths.map((mediaPath, index) => [mediaPath, mediaTimecodes[index] || ""]).filter((entry) => entry[1])
@@ -3578,7 +3837,7 @@ async function buildVbautXmlForScrape(scrape) {
     decisionsBySegment,
     timelineAlignment: null,
     mediaDir: PAMPAM_ROOT,
-    mediaPathRootOverride: null,
+    mediaPathRootOverride: process.env.PAMPAM_HOST_ROOT || null,
     fps: 50,
     defaultDurationSec: 5,
     sectionId: "",
@@ -3678,10 +3937,26 @@ async function attachLinkPreview(segment) {
   const buffer = Buffer.from(await imageResponse.arrayBuffer());
   if (!buffer.length || buffer.length > 15 * 1024 * 1024) throw new Error("invalid preview image size");
   const { safeTopic, dir } = await ensureTopicDir(segment.topic || "Без темы");
-  const digest = createHash("sha256").update(`${sourceUrl}\n${preview.image}`).digest("hex").slice(0, 12);
-  const fileName = `preview_${digest}${previewExtension(contentType, preview.image)}`;
-  const absolutePath = path.join(dir, fileName);
+  let fileName = `preview_${digest}${previewExtension(contentType, preview.image)}`;
+  let absolutePath = path.join(dir, fileName);
   await fs.writeFile(absolutePath, buffer);
+  if (/\.(avif|webp)$/i.test(fileName)) {
+    const ext = path.extname(fileName);
+    const jpgFileName = fileName.slice(0, -ext.length) + ".jpg";
+    const jpgAbsolutePath = path.join(dir, jpgFileName);
+    const tools = await resolveDownloaderTools();
+    const ffmpeg = tools.ffmpeg_path || "ffmpeg";
+    try {
+      await execFileAsync(ffmpeg, ["-y", "-i", absolutePath, "-q:v", "2", jpgAbsolutePath]);
+      if ((await fs.stat(jpgAbsolutePath).catch(() => null))?.size > 0) {
+        await fs.unlink(absolutePath).catch(() => null);
+        fileName = jpgFileName;
+        absolutePath = jpgAbsolutePath;
+      }
+    } catch (e) {
+      console.warn(`[image-convert] preview conversion failed: ${e.message}`);
+    }
+  }
   const normalizedName = await normalizeMediaFileNameOnDisk(dir, fileName);
   const normalizedStats = await fs.stat(path.join(dir, normalizedName));
   const relPath = path.posix.join(safeTopic, normalizedName);
@@ -4288,6 +4563,16 @@ async function handleRequest(req, res) {
         }
         return;
       }
+      if (parts[3] === "generate-tts") {
+        try {
+          const scrape = await readScrape(id);
+          const result = await generateTtsForScrapeSegments(scrape, writeScrape);
+          json(res, 200, { scrape, stats: result });
+        } catch (error) {
+          json(res, 500, { error: error.message });
+        }
+        return;
+      }
       if (parts[3] === "restore-latest") {
         const existing = await readScrape(id);
         const snapshot = await latestScrapeSnapshot(existing.id);
@@ -4600,7 +4885,8 @@ server.listen(PORT, async () => {
     resolveDownloaderTools,
     convertWebpToPng: convertWebpFileToPng,
     spawn,
-    getWebAppUrl: getTelegramWebAppUrl
+    getWebAppUrl: getTelegramWebAppUrl,
+    generateTtsForScrape: (scrape) => generateTtsForScrapeSegments(scrape, writeScrape)
   }).catch((err) => {
     console.error("Failed to start Telegram Bot:", err);
   });

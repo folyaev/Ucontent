@@ -30,8 +30,7 @@ RUN python3 -m venv .venv \
   && ./.venv/bin/python -m pip install -r tools/video-scene-cutter/requirements.txt \
   && if [ -f tools/utrends/requirements.txt ]; then ./.venv/bin/python -m pip install -r tools/utrends/requirements.txt; fi
 
-RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
-  && ln -sf /usr/local/bin/deno /usr/local/bin/deno
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 
 COPY . .
 

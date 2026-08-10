@@ -1,0 +1,13 @@
+Работай в текущем репозитории UContent. Прочитай файл `UContent_HandsFree_Review_Codex_Spec.md` целиком и реализуй его как рабочий vertical slice.
+
+Ключевое: не создавай новый проект и не ограничивайся планом. Сначала аудируй текущий код и `npm run check`, затем реализуй по фазам из спеки, начиная с persistence/state machine и отдельного `/review`, после чего голос, YouTube candidates/preview-first pipeline и Premiere MCP adapter.
+
+Сохрани существующие `/script-text`, Telegram, media download/cutter, Remotion и segment/media_items flows. UContent остаётся source of truth. Premiere — optional adapter с browser fallback. Не включай unsafe arbitrary scripting. Не задавай мне вопросы по обычным техническим решениям: проверяй среду, выбирай самый простой совместимый вариант и документируй решение.
+
+После каждой крупной фазы запускай тесты. В конце дай:
+1) что реально реализовано,
+2) какие файлы изменены,
+3) какие тесты прошли,
+4) как запустить `/review`,
+5) как проверить Premiere MCP,
+6) какие ограничения остались.
